@@ -31,12 +31,13 @@ const R_IN: f64 = 3.05; // inner rim of the disk (just outside the ISCO)
 const R_OUT: f64 = 11.0; // outer edge
 const CAM_D: f64 = 18.0; // camera distance from the hole
 const CAM_TILT: f64 = 0.100; // radians above the disk plane
-const VIEW: f64 = 0.42; // half height of the frustum (tangent of half fov)
-const ESCAPE: f64 = 42.0; // where a ray is considered free again
+const VIEW: f64 = 0.30; // half height of the frustum (tangent of half fov)
+const DISK_OPA: f64 = 0.05; // transmittance of one disk crossing (opaque disk)
+const ESCAPE: f64 = 32.0; // where a ray is considered free again
 const MAX_STEPS: usize = 900;
 const EXPOSURE: f64 = 1.0; // tone map exposure
-const BRIGHT: f64 = 1.6; // disk emission scale
-const STAR_DENSITY: f64 = 0.90; // higher = fewer stars
+const BRIGHT: f64 = 3.0; // disk emission scale
+const STAR_DENSITY: f64 = 0.74; // probability a cell is empty; lower = more stars
 const STAR_SHARP: f64 = 5.0; // higher = tighter points
 const STAR_SCALE: [f64; 3] = [44.0, 74.0, 120.0];
 const STAR_BRI: [f64; 3] = [1.0, 0.55, 0.30];
@@ -235,7 +236,7 @@ fn disk(rr: f64, hp: V3, vd: V3, t: f64) -> [f64; 3] {
     if rr <= R_IN || rr >= R_OUT {
         return [0.0; 3];
     }
-    let tf = (R_OUT - rr) / (R_OUT - R_IN); // 1 at the rim, 0 outside
+    let u = (rr - R_IN) / (R_OUT - R_IN); // 0 at the inner rim, 1 at the outer edge
 
     // turbulence, sheared by the Keplerian rotation
     let mut phi = hp.z.atan2(hp.x);
@@ -248,8 +249,8 @@ fn disk(rr: f64, hp: V3, vd: V3, t: f64) -> [f64; 3] {
     );
     let streak = 0.42 + 1.25 * n;
 
-    let edge_out = smoothstep(0.0, 0.42, tf);
-    let edge_in = smoothstep(0.0, 0.035, tf);
+    let edge_in = smoothstep(0.0, 0.05, u); // hot, sharp inner rim
+    let edge_out = 1.0 - smoothstep(0.72, 1.0, u); // cool, ragged outer edge
     let prof = (R_IN / rr).powf(1.55) * edge_in * edge_out * streak;
 
     // local Keplerian speed seen by a static observer: v^2 = M/(r-2M), M=RS/2
@@ -267,7 +268,9 @@ fn disk(rr: f64, hp: V3, vd: V3, t: f64) -> [f64; 3] {
     let g = clamp(g, 0.05, 4.0);
 
     let temp = clamp((R_IN / rr).powf(0.72) * (0.55 + 0.55 * g), 0.0, 1.0);
-    let inten = prof * g * g * g * BRIGHT;
+    // g^3 beaming, softened by an emissivity floor: a fully beaming disk leaves
+    // the receding half of the frame empty, which reads as a bug, not as physics.
+    let inten = prof * (0.35 + 0.65 * g * g * g) * BRIGHT;
     let c = heat(temp);
     [c[0] * inten, c[1] * inten, c[2] * inten]
 }
@@ -299,10 +302,14 @@ fn stars(d: V3, t: f64) -> [f64; 3] {
         lum += f2 * (0.4 + 0.6 * h0) * tw * STAR_BRI[k as usize];
         tint += f2 * hash3i(ci[0] + 3, ci[1] + 11, ci[2] + 5);
     }
-    // whisper of a galactic band so the void is not perfectly flat
+    // whisper of a galactic band so the void is not perfectly flat; the noise
+    // is only worth sampling inside the band, the rest of the sky is flat 0
     let band = (-((d.y * 2.6).abs().powf(1.6)) * 1.4).exp() * 0.010;
-    let neb = fbm3(d.x * 3.0 + 11.0, d.y * 3.0, d.z * 3.0 - 7.0);
-    let g = band * (0.4 + 1.2 * neb);
+    let g = if band > 1e-3 {
+        band * (0.4 + 1.2 * fbm3(d.x * 3.0 + 11.0, d.y * 3.0, d.z * 3.0 - 7.0))
+    } else {
+        0.0
+    };
     [
         lum * (0.85 + 0.4 * tint) + g * 0.7,
         lum * (0.88 + 0.3 * tint) + g * 0.8,
@@ -319,6 +326,10 @@ fn trace(cam: &Cam, dir: V3, t: f64) -> [f64; 3] {
     let h2 = p.cross(v).len2();
     let mut col = [0.0; 3]; // HDR disk light, tone mapped at the end
     let mut bg = [0.0; 3]; // background sky, already display referred
+    // The disk is optically thick: the near side silhouettes everything behind
+    // it, which is what carves the shadow out of the glow. Each crossing lets
+    // only a few per cent of the light from behind through.
+    let mut tr = 1.0; // remaining transmittance
     let mut a = accel(p, h2);
     let mut steps = 0;
 
@@ -336,8 +347,10 @@ fn trace(cam: &Cam, dir: V3, t: f64) -> [f64; 3] {
         if steps > MAX_STEPS {
             break;
         }
-        // adaptive step: fine near the hole, coarse far away
-        let dt = clamp(0.045 * r, 0.012, 0.55);
+        // adaptive step: fine near the hole, coarse far away. The cap may be
+        // generous - out there the orbit is straight and only the sky lookup
+        // is left to pay for.
+        let dt = clamp(0.045 * r, 0.012, 1.1);
         let pn = p + v * dt + a * (0.5 * dt * dt);
         let an = accel(pn, h2);
         let vn = v + (a + an) * (0.5 * dt);
@@ -350,9 +363,14 @@ fn trace(cam: &Cam, dir: V3, t: f64) -> [f64; 3] {
             if rr > R_IN && rr < R_OUT {
                 let vd = (v + (vn - v) * k).norm(); // direction of travel (away from us)
                 let e = disk(rr, hp, vd, t);
+                // Grazing crossings pile an enormous projected area into a single
+                // row of pixels (the plane's horizon line) - fade those out, the
+                // way a real thin disk's photosphere limb-darkens edge-on.
+                let graze = smoothstep(0.0, 0.045, v.y.abs());
                 for i in 0..3 {
-                    col[i] += e[i];
+                    col[i] += tr * e[i] * graze;
                 }
+                tr *= DISK_OPA;
             }
         }
         p = pn;
@@ -400,6 +418,9 @@ struct Opt {
     color: bool,
     cols: usize,
     rows: usize,
+    /// emit target in device pixels (sixel) or character sub-pixels (rest)
+    tpw: usize,
+    tph: usize,
     one_shot: Option<f64>,
     ramp: Vec<char>,
 }
@@ -424,6 +445,8 @@ fn parse_opt() -> Opt {
         color: true,
         cols: 0,
         rows: 0,
+        tpw: 0,
+        tph: 0,
         one_shot: None,
         ramp: " .·:;+=*xX#%@█".chars().collect(),
     };
@@ -485,6 +508,17 @@ fn parse_opt() -> Opt {
     }
     o.cols = o.cols.clamp(20, 600);
     o.rows = o.rows.clamp(10, 300);
+    // ascii/braille draw one character per SUB_X x SUB_Y block of rays; sixel
+    // has no such grid - it paints device pixels, so the picture must be
+    // rendered at the real pixel size of cols x rows cells or it comes out a
+    // couple of times smaller than the window.
+    let (cw, ch) = if o.mode == Mode::Sixel {
+        cell_pixels()
+    } else {
+        (SUB_X, SUB_Y)
+    };
+    o.tpw = o.cols * cw;
+    o.tph = o.rows * ch;
     o
 }
 
@@ -495,6 +529,10 @@ USAGE: blackhole [OPTIONS]
 
 MODES
   -m, --mode ascii|braille|sixel   renderer (default: ascii)
+      ascii   one character per block, truecolour ANSI
+      braille higher apparent resolution via braille dots
+      sixel   real graphics; the image is rendered at device-pixel size
+              (the cell size is asked from the terminal via CSI 16 t)
 
 OPTIONS
       --fps <n>         frame rate (default: 30)
@@ -512,6 +550,51 @@ KEYS        q/Esc quit    +/- zoom    space pause
 ";
 
 // ---------------------------------------------------------------- terminal
+
+/// Size of one character cell in device pixels, asked from the terminal with
+/// XTWINOPS `CSI 16 t` (reply `CSI 6 ; height ; width t`). Only sixel needs it.
+/// A terminal that does not answer gets the usual 10x20 guess.
+fn cell_pixels() -> (usize, usize) {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return (10, 20);
+    }
+    let _ = Command::new("stty")
+        .args(["raw", "-echo", "min", "0", "time", "1"])
+        .status();
+    let mut so = std::io::stdout();
+    let _ = so.write_all(b"\x1b[16t");
+    let _ = so.flush();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 32];
+    for _ in 0..3 {
+        // `time 1` above makes each read give up after 100 ms
+        match std::io::stdin().read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(k) => {
+                got.extend_from_slice(&buf[..k]);
+                if got.ends_with(b"t") {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = Command::new("stty").args(["sane"]).status();
+    let s = String::from_utf8_lossy(&got);
+    let body = s.trim_start_matches('\x1b').trim_start_matches('[');
+    let body = body.trim_end_matches('t');
+    let mut it = body.split(';');
+    if it.next() == Some("6") {
+        if let (Some(h), Some(w)) = (it.next(), it.next()) {
+            if let (Ok(h), Ok(w)) = (h.parse::<usize>(), w.parse::<usize>()) {
+                if h > 0 && w > 0 {
+                    return (w, h);
+                }
+            }
+        }
+    }
+    (10, 20)
+}
 
 fn term_size() -> (usize, usize) {
     // ask the tty first (works when stdin is a terminal)
@@ -597,9 +680,17 @@ struct Frame {
     px: Vec<[f64; 3]>,
 }
 
+/// Rays are cast on a grid no denser than RAY_BUDGET; if the emit target is
+/// larger the renderers upsample with nearest neighbour. Keeps sixel frames
+/// (device-pixel sized) from costing seconds each.
+const RAY_BUDGET: usize = 200_000;
+
 fn render_frame(o: &Opt, t: f64) -> Frame {
-    let w = o.cols * SUB_X;
-    let h = o.rows * SUB_Y;
+    let s = (RAY_BUDGET as f64 / (o.tpw as f64 * o.tph as f64))
+        .min(1.0)
+        .sqrt();
+    let w = ((o.tpw as f64 * s).round() as usize).max(80);
+    let h = ((o.tph as f64 * s).round() as usize).max(40);
     let mut px = vec![[0.0f64; 3]; w * h];
     let orbit = o.orbit.to_radians() * t; // radians per second
     let cam = Cam::new(orbit, o.tilt.to_radians());
@@ -753,42 +844,64 @@ fn draw_braille(o: &Opt, f: &Frame, out: &mut String) {
     }
 }
 
-fn draw_sixel(_o: &Opt, f: &Frame, out: &mut String) {
-    // register 0 = black, registers 16..231 = a 6x6x6 colour cube
+fn draw_sixel(o: &Opt, f: &Frame, out: &mut String) {
+    // Sixel paints device pixels, so map the ray grid up to the target size
+    // (nearest neighbour) instead of drawing the picture a fifth of the
+    // window wide.
+    let tw = o.tpw;
+    let th = o.tph;
+    let mut col: Vec<usize> = vec![0; tw];
+    for x in 0..tw {
+        col[x] = x * f.w / tw.max(1);
+    }
+
+    // register 0 = black, registers 16..231 = a 6x6x6 colour cube.
+    //
+    // Registers use the RGB form `#idx;2;r;g;b` with components in per cent
+    // (0..=100).  The colourspace selector `2;` is mandatory: a bare
+    // `#idx;r;g;b` makes a strict parser read r as the colourspace and throw the
+    // whole image away, and components above 100 are rejected just as loudly.
+    let mut used = [false; 216];
+    for p in &f.px {
+        used[pixel_index(p)] = true;
+    }
     out.push_str("\x1bPq#0;2;0;0;0");
     for b in 0..6usize {
         for g in 0..6usize {
             for r in 0..6usize {
+                if !used[36 * r + 6 * g + b] {
+                    continue;
+                }
                 let idx = 16 + 36 * r + 6 * g + b;
                 out.push('#');
                 push_u32(out, idx as u32);
-                out.push_str(";2;");
-                push_u32(out, (r * 51) as u32);
-                out.push(';');
-                push_u32(out, (g * 51) as u32);
-                out.push(';');
-                push_u32(out, (b * 51) as u32);
+                out.push_str(";2");
+                for c in [r, g, b] {
+                    out.push(';');
+                    push_u32(out, (c * 20) as u32);
+                }
             }
         }
     }
 
-    let bands = (f.h + 5) / 6;
-    let mut row: Vec<u8> = vec![0; f.w];
+    let bands = (th + 5) / 6;
+    let mut row: Vec<u8> = vec![0; tw];
     let mut strip: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
     for band in 0..bands {
         strip.clear();
         for sy in 0..6usize {
-            let y = band * 6 + sy;
-            if y >= f.h {
+            let ty = band * 6 + sy;
+            if ty >= th {
                 break;
             }
-            for x in 0..f.w {
-                let p = f.px[y * f.w + x];
+            let y = ty * f.h / th.max(1);
+            for x in 0..tw {
+                let p = f.px[y * f.w + col[x]];
                 if lum(&p) < 0.02 {
                     continue;
                 }
                 let idx = pixel_index(&p);
-                let e = strip.entry(idx).or_insert_with(|| vec![0; f.w]);
+                let e = strip.entry(idx).or_insert_with(|| vec![0; tw]);
                 e[x] |= 1 << sy;
             }
         }
@@ -796,13 +909,18 @@ fn draw_sixel(_o: &Opt, f: &Frame, out: &mut String) {
         row.fill(0x3f);
         out.push_str("#0");
         write_row(out, &row);
+        out.push('$');
         for (idx, mask) in strip.iter() {
             out.push('#');
             push_u32(out, (16 + idx) as u32);
             write_row(out, mask);
+            // `$` rewinds to the left edge of the band: without it the next
+            // colour strip would be drawn to the right of this one.
+            out.push('$');
         }
         if band + 1 < bands {
-            out.push('$');
+            // `-` is the raster advance: next band, left margin.
+            out.push('-');
         }
     }
     out.push_str("\x1b\\");
@@ -814,7 +932,11 @@ fn pixel_index(p: &[f64; 3]) -> usize {
     36 * q(p[0]) + 6 * q(p[1]) + q(p[2])
 }
 
-/// emit one colour row of a sixel band, skipping transparent runs
+/// Emit one colour row of a sixel band. Runs longer than one pixel are
+/// compressed with the `!` repeat introducer - a bare digit after a register
+/// number or after data is not a count, it is a parameter and gets swallowed.
+/// Transparent runs (all bits clear, `?`) must still be written out: dropping
+/// them would slide everything after them to the left.
 fn write_row(out: &mut String, row: &[u8]) {
     let mut x = 0;
     while x < row.len() {
@@ -823,12 +945,11 @@ fn write_row(out: &mut String, row: &[u8]) {
         while x + n < row.len() && row[x + n] == v {
             n += 1;
         }
-        if v != 0 {
-            if n > 1 {
-                push_u32(out, n as u32);
-            }
-            out.push((0x3f + v) as char);
+        if n > 1 {
+            out.push('!');
+            push_u32(out, n as u32);
         }
+        out.push((0x3f + v) as char);
         x += n;
     }
 }
@@ -837,10 +958,6 @@ fn write_row(out: &mut String, row: &[u8]) {
 
 fn main() {
     let mut o = parse_opt();
-    if o.mode == Mode::Sixel && o.one_shot.is_none() {
-        // sixel needs no clearing, we always paint an opaque background band
-    }
-    if env::var("BH_DEBUG").is_ok() { debug_rays(); }
     let mut out = String::with_capacity(1 << 22);
 
     if let Some(n) = o.one_shot {
@@ -897,109 +1014,4 @@ fn draw_into(o: &Opt, f: &Frame, out: &mut String) {
         Mode::Braille => draw_braille(o, f, out),
         Mode::Sixel => draw_sixel(o, f, out),
     }
-}
-
-/// debug-only: integrate and report capture + where the ray crosses the disk
-#[allow(dead_code)]
-fn probe(cam: &Cam, dir: V3) -> (bool, f64, Vec<f64>) {
-    let mut p = cam.p;
-    let mut v = dir;
-    let h2 = p.cross(v).len2();
-    let mut a = accel(p, h2);
-    let mut rmin = p.len();
-    let mut xs = Vec::new();
-    for steps in 0..MAX_STEPS {
-        let r = p.len();
-        rmin = rmin.min(r);
-        if r <= RS {
-            return (true, rmin, xs);
-        }
-        if r > ESCAPE && p.dot(v) > 0.0 {
-            return (false, rmin, xs);
-        }
-        let dt = clamp(0.045 * r, 0.012, 0.55);
-        let _ = steps;
-        let pn = p + v * dt + a * (0.5 * dt * dt);
-        let an = accel(pn, h2);
-        let vn = v + (a + an) * (0.5 * dt);
-        if p.y * pn.y < 0.0 {
-            let k = p.y / (p.y - pn.y);
-            let hp = p + (pn - p) * k;
-            xs.push((hp.x * hp.x + hp.z * hp.z).sqrt());
-        }
-        p = pn;
-        v = vn;
-        a = an;
-    }
-    (false, rmin, xs)
-}
-
-#[allow(dead_code)]
-fn debug_rays() {
-    let cam = Cam::new(0.0, CAM_TILT);
-    eprintln!("cam.p = {:?}", cam.p);
-    if std::env::var("BH_DEBUG").unwrap() == "3" {
-        // structural map: X = captured (shadow), d = direct disk, l = lensed only
-        let (w, h) = (120usize, 60usize);
-        for y in 0..h {
-            let mut row = String::new();
-            for x in 0..w {
-                let d = cam.ray(x, y, w, h, 1.0, 0.0);
-                let (cap, _, xs) = probe(&cam, d);
-                let n = xs.iter().filter(|r| **r > R_IN && **r < R_OUT).count();
-                row.push(if cap { 'X' } else if n > 0 { 'd' } else { ' ' });
-            }
-            eprintln!("{row}");
-        }
-        std::process::exit(0);
-    }
-    if std::env::var("BH_DEBUG").unwrap() == "2" {
-        let (w, h) = (120usize, 60usize);
-        let mut maxl = 0.0f64;
-        let mut sum = 0.0f64;
-        let mut ndisk = 0usize;
-        for y in 0..h {
-            let mut row = String::new();
-            for x in 0..w {
-                let d = cam.ray(x, y, w, h, 1.0, 0.0);
-                let l = lum(&trace(&cam, d, 0.0));
-                if !l.is_finite() {
-                    eprintln!("NONFINITE x={x} y={y} d={d:?}");
-                    row.push('!');
-                    continue;
-                }
-                maxl = maxl.max(l);
-                sum += l;
-                if l > 0.25 {
-                    ndisk += 1;
-                }
-                row.push(" .:-=+*#%@[".chars().nth(clamp(l * 10.9, 0.0, 10.99) as usize).unwrap());
-            }
-            eprintln!("{row}");
-        }
-        eprintln!(
-            "max={maxl:.3} mean={:.3} bright={} ({:.1}%)",
-            sum / (w * h) as f64,
-            ndisk,
-            100.0 * ndisk as f64 / (w * h) as f64
-        );
-        std::process::exit(0);
-    }
-    eprintln!("-- capture sweep (theta from the aim axis, in the up direction);");
-    for i in 0..40 {
-        let th = -0.45 + 0.9 * i as f64 / 39.0;
-        let d = (cam.f * th.cos() + cam.u * th.sin()).norm();
-        let (cap, rmin, xs) = probe(&cam, d);
-        let b = cam.p.cross(d).len();
-        let xd: Vec<String> = xs.iter().map(|v| format!("{v:.2}")).collect();
-        eprintln!(
-            "th={:+.3} b={:5.2} {} rmin={:6.2} xs=[{}]",
-            th,
-            b,
-            if cap { "CAP" } else { "   " },
-            rmin,
-            xd.join(",")
-        );
-    }
-    std::process::exit(0);
 }
