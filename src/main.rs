@@ -29,7 +29,8 @@ const RS: f64 = 1.0;
 const R_IN: f64 = 3.05; // inner rim of the disk (just outside the ISCO)
 const R_OUT: f64 = 11.0; // outer edge
 const CAM_D: f64 = 18.0; // camera distance from the hole
-const CAM_TILT: f64 = 0.100; // radians above the disk plane
+const CAM_TILT: f64 = 0.100; // degrees above the disk plane: near edge-on,
+// the classic look - the disk's thickness on screen is mostly lensing
 const VIEW: f64 = 0.30; // half height of the frustum (tangent of half fov)
 const DISK_OPA: f64 = 0.05; // transmittance of one disk crossing (opaque disk)
 const ESCAPE: f64 = 32.0; // where a ray is considered free again
@@ -870,7 +871,7 @@ OPTIONS
       --frame <n>       render a single frame at time n/fps and exit
       --no-color        no ANSI colours (pure ASCII output, good for pipes)
 
-KEYS        q/Esc quit    +/- zoom    space pause
+KEYS        q/Esc quit    +/- zoom    up/down tilt    space pause
 ";
 
 // ---------------------------------------------------------------- terminal
@@ -979,18 +980,61 @@ impl Drop for RawTerm {
     }
 }
 
-fn poll_key() -> Option<char> {
+/// A keypress, with arrow escape sequences told apart from a plain Esc.
+enum Key {
+    Char(char),
+    Esc,
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// Camera tilt step per arrow press, in degrees (terminals auto-repeat held
+/// keys, so this is also the slew rate: ~1 deg per press at ~25 cps).
+const TILT_STEP: f64 = 1.0;
+/// Stay away from exactly +-90 deg: there the camera basis degenerates
+/// (forward becomes parallel to the world-up axis).
+const TILT_LIMIT: f64 = 80.0;
+
+/// Poll stdin for one key. Arrow keys arrive as 3-byte bursts (`ESC [ A`, or
+/// `ESC O A` in application cursor mode); a lone ESC is either the Esc key
+/// or a burst that came in fragmented, so give the terminal a few
+/// milliseconds to finish it before deciding.
+fn poll_key() -> Option<Key> {
+    let seq = |c: u8| match c {
+        b'A' => Some(Key::Up),
+        b'B' => Some(Key::Down),
+        b'C' => Some(Key::Right),
+        b'D' => Some(Key::Left),
+        _ => None,
+    };
     let mut b = [0u8; 8];
-    match std::io::stdin().read(&mut b) {
-        Ok(0) | Err(_) => None,
-        Ok(_n) => {
-            // skip escape sequences (arrow keys & friends)
-            if b[0] == 0x1b {
-                return Some('\x1b');
-            }
-            Some(b[0] as char)
-        }
+    let n = match std::io::stdin().read(&mut b) {
+        Ok(0) | Err(_) => return None,
+        Ok(n) => n,
+    };
+    if b[0] != 0x1b {
+        return Some(Key::Char(b[0] as char));
     }
+    if n >= 3 && (b[1] == b'[' || b[1] == b'O') {
+        return seq(b[2]);
+    }
+    if n == 1 {
+        let mut m = 0;
+        for _ in 0..3 {
+            thread::sleep(Duration::from_millis(1));
+            m += std::io::stdin().read(&mut b[1 + m..]).unwrap_or(0);
+            if m >= 2 {
+                break;
+            }
+        }
+        if m >= 2 && (b[1] == b'[' || b[1] == b'O') {
+            return seq(b[2]);
+        }
+        return Some(Key::Esc);
+    }
+    None
 }
 
 // ---------------------------------------------------------------- renderers
@@ -1582,16 +1626,27 @@ fn main() {
         }
         if let Some(k) = poll_key() {
             match k {
-                'q' | '\x1b' | 'c' => break,
-                ' ' => paused = !paused,
-                '+' | '=' => {
+                Key::Esc | Key::Char('q') | Key::Char('c') => break,
+                Key::Char(' ') => paused = !paused,
+                Key::Char('+') | Key::Char('=') => {
                     o.zoom = (o.zoom * 1.15).clamp(0.25, 6.0);
                     drawn = false;
                 }
-                '-' | '_' => {
+                Key::Char('-') | Key::Char('_') => {
                     o.zoom = (o.zoom / 1.15).clamp(0.25, 6.0);
                     drawn = false;
                 }
+                // tilt the camera over/under the disk plane; tilt is part of
+                // the geometry cache key, so the next frame re-traces
+                Key::Up => {
+                    o.tilt = (o.tilt + TILT_STEP).min(TILT_LIMIT);
+                    drawn = false;
+                }
+                Key::Down => {
+                    o.tilt = (o.tilt - TILT_STEP).max(-TILT_LIMIT);
+                    drawn = false;
+                }
+                // Left/Right are parsed but not bound to anything yet
                 _ => {}
             }
         }
