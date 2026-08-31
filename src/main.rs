@@ -14,7 +14,6 @@
 //!
 //! No external crates.
 
-use std::collections::BTreeMap;
 use std::env;
 use std::io::{Read, Write};
 use std::process::Command;
@@ -38,9 +37,19 @@ const MAX_STEPS: usize = 900;
 const EXPOSURE: f64 = 1.0; // tone map exposure
 const BRIGHT: f64 = 3.0; // disk emission scale
 const STAR_DENSITY: f64 = 0.74; // probability a cell is empty; lower = more stars
-const STAR_SHARP: f64 = 5.0; // higher = tighter points
+/// target Gaussian radius of a star core, in ray-grid pixels; the actual
+/// angular sigma is derived from it so a star is a crisp dot at every
+/// resolution instead of a fixed-angle blob
+const STAR_CORE: f64 = 0.6;
 const STAR_SCALE: [f64; 3] = [44.0, 74.0, 120.0];
 const STAR_BRI: [f64; 3] = [1.0, 0.55, 0.30];
+/// Soft cap on how fast the disk turbulence may drift, in device pixels per
+/// second. The Keplerian pattern near the inner rim moves at ~1.6 rad/s,
+/// which is over a thousand pixels per second on a sixel grid - fine noise
+/// granules then jump dozens of pixels between frames and the disk turns into
+/// strobing static. Character grids are coarse enough that the cap never
+/// engages there; their calm look is what this reproduces at device size.
+const TURB_MAX_PX: f64 = 300.0;
 
 // ------------------------------------------------------------------- maths
 
@@ -228,30 +237,122 @@ impl V3 {
     }
 }
 
+
+// --------------------------------------------------------- sampled tables
+//
+// Three per-frame transcendental costs dominated the profile, and all three
+// are smooth enough to pre-sample:
+//  - the disk turbulence is fbm3 over (cos(phi), sin(phi), nz(rr)) - a 2D
+//    field in (phi, radius), rasterised once into a texture;
+//  - the tone curve (1 - e^-x)^(1/1.85) has infinite slope at 0, so it is
+//    sampled on a sqrt-spaced grid;
+//  - the star twinkle needs one sin per sky pixel - a 7th-order polynomial
+//    is indistinguishable at the 0.18 amplitude it modulates.
+
+const TURB_K: f64 = 2.1; // turbulence noise frequency (see disk_em / shade)
+const TAU: f64 = std::f64::consts::TAU;
+const TURB_PHI: usize = 1024;
+const TURB_RR: usize = 512;
+static TURB_TEX: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+
+/// Fill the turbulence texture once. About half a million noise lookups -
+/// a tenth of a second single-threaded, a few milliseconds across cores,
+/// and afterwards every frame samples it instead of recomputing fbm3.
+fn build_turb_tex() {
+    let mut tex = vec![0.0f64; TURB_RR * TURB_PHI];
+    let nthreads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 32);
+    let rows_per = (TURB_RR + nthreads - 1) / nthreads;
+    thread::scope(|sc| {
+        for (n, band) in tex.chunks_mut(rows_per * TURB_PHI).enumerate() {
+            sc.spawn(move || {
+                for (r, row) in band.chunks_mut(TURB_PHI).enumerate() {
+                    let rr =
+                        R_IN + (n * rows_per + r) as f64 / TURB_RR as f64 * (R_OUT - R_IN);
+                    let nz = rr * 0.55 + (rr * 0.21).sin() * 0.8;
+                    for (i, v) in row.iter_mut().enumerate() {
+                        let phi = (i as f64 + 0.5) / TURB_PHI as f64 * TAU;
+                        *v = fbm3(phi.cos() * TURB_K, phi.sin() * TURB_K, nz);
+                    }
+                }
+            });
+        }
+    });
+    let _ = TURB_TEX.set(tex);
+}
+
+/// Bilinear sample of the turbulence at pattern angle `phi` (any range) and
+/// disk radius `rr`. This is what a frame pays per disk crossing.
+#[inline]
+fn turb(phi: f64, rr: f64) -> f64 {
+    let tex = TURB_TEX.get().expect("turbulence texture");
+    let mut u = (phi * (TURB_PHI as f64 / TAU)).fract();
+    if u < 0.0 {
+        u += 1.0;
+    }
+    let v = ((rr - R_IN) / (R_OUT - R_IN)).clamp(0.0, 1.0) * TURB_RR as f64;
+    let fu = u * TURB_PHI as f64;
+    let iu = fu as usize % TURB_PHI;
+    let au = fu - fu.floor();
+    let iv = (v as usize).min(TURB_RR - 1);
+    let av = v - v.floor();
+    let iv1 = (iv + 1).min(TURB_RR - 1);
+    let iu1 = (iu + 1) % TURB_PHI;
+    let a = tex[iv * TURB_PHI + iu] + (tex[iv * TURB_PHI + iu1] - tex[iv * TURB_PHI + iu]) * au;
+    let b = tex[iv1 * TURB_PHI + iu]
+        + (tex[iv1 * TURB_PHI + iu1] - tex[iv1 * TURB_PHI + iu]) * au;
+    a + (b - a) * av
+}
+
+/// tone curve, sampled sqrt-spaced in x (dense where the slope blows up)
+const TONE_N: usize = 4096;
+const TONE_MAX: f64 = 16.0;
+static TONE: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+
+fn build_tone() {
+    let t: Vec<f64> = (0..=TONE_N)
+        .map(|i| {
+            let x = TONE_MAX * (i as f64 / TONE_N as f64) * (i as f64 / TONE_N as f64);
+            (1.0 - (-x).exp()).powf(1.0 / 1.85)
+        })
+        .collect();
+    let _ = TONE.set(t);
+}
+
+#[inline]
+fn tone(x: f64) -> f64 {
+    let t = TONE.get().expect("tone table");
+    let s = (x.max(0.0) / TONE_MAX).sqrt() * TONE_N as f64;
+    let i = (s as usize).min(TONE_N - 1);
+    let a = s - i as f64;
+    t[i] + (t[i + 1] - t[i]) * a
+}
+
+/// sin to 1e-4 - all the twinkle needs (it modulates brightness by +-18%)
+#[inline]
+fn tw_sin(x: f64) -> f64 {
+    let q = (x / std::f64::consts::PI).round();
+    let y = x - q * std::f64::consts::PI;
+    let s = if (q as i64) & 1 == 0 { 1.0 } else { -1.0 };
+    let y2 = y * y;
+    s * y * (1.0 - y2 * (1.0 / 6.0 - y2 * (1.0 / 120.0 - y2 * (1.0 / 5040.0))))
+}
+
 // ------------------------------------------------------------ the disk
 //
-/// Emission of the thin disk at radius `rr`, hit point `hp`, photon direction
-/// `vd` (integrated backwards, i.e. away from the camera).
-fn disk(rr: f64, hp: V3, vd: V3, t: f64) -> [f64; 3] {
-    if rr <= R_IN || rr >= R_OUT {
-        return [0.0; 3];
-    }
+/// Time-independent part of the disk emission at one crossing: colour times
+/// intensity with the turbulence streak factored out, because the streak is
+/// the only thing that still moves once the geodesics are traced. Returns the
+/// emission and the angular drift rate of the pattern at this radius, so a
+/// frame only pays for one noise lookup per crossing.
+fn disk_em(rr: f64, hp: V3, vd: V3) -> ([f64; 3], f64) {
     let u = (rr - R_IN) / (R_OUT - R_IN); // 0 at the inner rim, 1 at the outer edge
-
-    // turbulence, sheared by the Keplerian rotation
-    let mut phi = hp.z.atan2(hp.x);
-    phi -= t * 1.6 * (R_IN / rr).powf(1.5);
-    let k = 2.1;
-    let n = fbm3(
-        phi.cos() * k,
-        phi.sin() * k,
-        rr * 0.55 + (rr * 0.21).sin() * 0.8,
-    );
-    let streak = 0.42 + 1.25 * n;
 
     let edge_in = smoothstep(0.0, 0.05, u); // hot, sharp inner rim
     let edge_out = 1.0 - smoothstep(0.72, 1.0, u); // cool, ragged outer edge
-    let prof = (R_IN / rr).powf(1.55) * edge_in * edge_out * streak;
+    let rad = (R_IN / rr).powf(1.55) * edge_in * edge_out;
 
     // local Keplerian speed seen by a static observer: v^2 = M/(r-2M), M=RS/2
     let rs_r = RS / rr;
@@ -270,18 +371,60 @@ fn disk(rr: f64, hp: V3, vd: V3, t: f64) -> [f64; 3] {
     let temp = clamp((R_IN / rr).powf(0.72) * (0.55 + 0.55 * g), 0.0, 1.0);
     // g^3 beaming, softened by an emissivity floor: a fully beaming disk leaves
     // the receding half of the frame empty, which reads as a bug, not as physics.
-    let inten = prof * (0.35 + 0.65 * g * g * g) * BRIGHT;
+    let inten = rad * (0.35 + 0.65 * g * g * g) * BRIGHT;
     let c = heat(temp);
-    [c[0] * inten, c[1] * inten, c[2] * inten]
+    let om = 1.6 * (R_IN / rr).powf(1.5); // pattern drift rate at this radius
+    (
+        [c[0] * inten, c[1] * inten, c[2] * inten],
+        om,
+    )
 }
 
 // ------------------------------------------------------------- deep space
 
-/// Deep space. Returned already display-referred (0..1) on purpose: the tone
-/// curve below must not lift the void, or the hole drowns in grey noise.
-fn stars(d: V3, t: f64) -> [f64; 3] {
+/// Deep space, split the same way as the disk: everything is computed once
+/// per ray and only the twinkle phase is left for the frame. Display-referred
+/// (0..1) on purpose - the tone curve below must not lift the void, or the
+/// hole drowns in grey noise.
+#[derive(Clone, Copy)]
+struct Sky {
+    /// stars at twinkle = 1 (tint already folded in)
+    star: [f64; 3],
+    /// the galactic band, which does not twinkle at all
+    band: [f64; 3],
+    /// twinkle = 0.82 + 0.18 sin(t * freq + phase), taken from the brightest
+    /// contributing star cell
+    freq: f64,
+    phase: f64,
+}
+
+/// The galactic band weight exp(-(|y|·2.6)^1.6·1.4)·0.01 as a function of
+/// |d.y|. It is a smooth 1D curve, so it is sampled once into a small table:
+/// the powf+exp pair cost more than everything else in the sky lookup, and
+/// with an orbiting camera the lookup runs for every sky pixel every frame.
+static BAND_LUT: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+fn band_w(ay: f64) -> f64 {
+    let t = BAND_LUT.get_or_init(|| {
+        (0..=512)
+            .map(|i| {
+                let y = i as f64 / 512.0;
+                (-((y * 2.6).powf(1.6)) * 1.4).exp() * 0.010
+            })
+            .collect()
+    });
+    let f = (ay * 512.0).min(511.999).max(0.0);
+    let i = f as usize;
+    let a = f - i as f64;
+    t[i] * (1.0 - a) + t[i + 1] * a
+}
+
+/// Star contribution (at twinkle = 1) and its twinkle parameters.
+fn star_layer(d: V3, ppc0: f64) -> ([f64; 3], f64, f64) {
     let mut lum = 0.0;
     let mut tint = 0.0;
+    let mut wmax = 0.0f64;
+    let mut freq = 2.0;
+    let mut phase = 0.0;
     for k in 0..3 {
         let p = d * STAR_SCALE[k as usize];
         let ci = [p.x.round() as i64, p.y.round() as i64, p.z.round() as i64];
@@ -293,59 +436,157 @@ fn stars(d: V3, t: f64) -> [f64; 3] {
         let dy = p.y - (ci[1] as f64 + (hash3i(ci[0], ci[1] + 7, ci[2]) - 0.5) * 0.6);
         let dz = p.z - (ci[2] as f64 + (hash3i(ci[0], ci[1] + 7, ci[2] + 7) - 0.5) * 0.6);
         let r2 = dx * dx + dy * dy + dz * dz;
-        let f = (1.0 - r2 * STAR_SHARP).max(0.0);
-        if f <= 0.0 {
-            continue;
+        // Gaussian point spread sized to the sampling pitch: `ppc0` is how many
+        // ray pixels one layer-0 cell spans, so sigma in cells makes the core
+        // ~STAR_CORE pixels wide. A fixed-angle falloff instead renders as soft
+        // hand-sized blobs at device resolution - a film over the sky, not
+        // stars - and buries the encoder in near-black colour strips.
+        let ppc = ppc0 * STAR_SCALE[0] / STAR_SCALE[k as usize];
+        let sigma = clamp(STAR_CORE / ppc, 0.02, 0.30);
+        let s2 = r2 / (2.0 * sigma * sigma);
+        if s2 > 30.0 {
+            continue; // far out in the Gaussian tail
         }
-        let f2 = f * f * f;
-        let tw = 0.82 + 0.18 * (t * (1.5 + h0 * 2.0) + h0 * 40.0).sin();
-        lum += f2 * (0.4 + 0.6 * h0) * tw * STAR_BRI[k as usize];
+        let f2 = (-s2).exp();
+        let w = f2 * STAR_BRI[k as usize];
+        lum += w * (0.4 + 0.6 * h0);
         tint += f2 * hash3i(ci[0] + 3, ci[1] + 11, ci[2] + 5);
+        if w > wmax {
+            // this layer dominates: its twinkle drives the whole pixel
+            wmax = w;
+            freq = 1.5 + h0 * 2.0;
+            phase = h0 * 40.0;
+        }
     }
-    // whisper of a galactic band so the void is not perfectly flat; the noise
-    // is only worth sampling inside the band, the rest of the sky is flat 0
-    let band = (-((d.y * 2.6).abs().powf(1.6)) * 1.4).exp() * 0.010;
+    (
+        [lum * (0.85 + 0.4 * tint), lum * (0.88 + 0.3 * tint), lum],
+        freq,
+        phase,
+    )
+}
+
+fn stars(d: V3, ppc0: f64) -> Sky {
+    let (star, freq, phase) = star_layer(d, ppc0);
+    // whisper of a galactic band so the void is not perfectly flat; it is a
+    // function of d.y alone, so a yawing camera leaves it untouched
+    let band = if d.y.abs() < 0.75 { band_w(d.y.abs()) } else { 0.0 };
     let g = if band > 1e-3 {
         band * (0.4 + 1.2 * fbm3(d.x * 3.0 + 11.0, d.y * 3.0, d.z * 3.0 - 7.0))
     } else {
         0.0
     };
-    [
-        lum * (0.85 + 0.4 * tint) + g * 0.7,
-        lum * (0.88 + 0.3 * tint) + g * 0.8,
-        lum + g,
-    ]
+    Sky {
+        star,
+        band: [g * 0.7, g * 0.8, g],
+        freq,
+        phase,
+    }
 }
 
-// ------------------------------------------------------------- ray tracing
+/// Sky for an orbiting camera: only the star positions move. The band is
+/// exactly invariant under yaw (it depends on d.y alone) and the twinkle
+/// parameters belong to the pixel's neighbourhood, so both are reused.
+fn stars_moved(d: V3, ppc0: f64, cached: &Sky) -> Sky {
+    let (star, _, _) = star_layer(d, ppc0);
+    Sky { star, band: cached.band, freq: cached.freq, phase: cached.phase }
+}
 
-/// Integrate one ray backwards from the camera. Returns linear RGB.
-fn trace(cam: &Cam, dir: V3, t: f64) -> [f64; 3] {
+// --------------------------------------------------------- ray tracing
+//
+// Split into an expensive geometry pass and a cheap shading pass.
+//
+// The geometry - integrating the null geodesics - does not depend on time
+// at all: with a still camera the ray paths are identical frame after frame.
+// What changes with t is only the shading: the disk's turbulence drifts and
+// the stars twinkle. So trace once per camera setup, keep for every pixel
+// the plane crossings and the escape direction, and let each animation frame
+// re-evaluate only the emission. Video codecs call these I-frames and
+// P-frames; here a P-frame costs a fraction of the I-frame.
+
+/// One crossing of the equatorial plane inside the disk, reduced to what a
+/// frame actually needs: the position (for the noise phase), the radius, the
+/// pattern drift rate and the fully pre-weighted static emission.
+#[derive(Clone, Copy)]
+struct Cross {
+    x: f64,
+    z: f64,
+    /// angular drift rate of the turbulence pattern at this radius
+    om: f64,
+    /// static emission (colour, profile, Doppler beaming, transmittance and
+    /// grazing fade all folded together); multiply by the streak and done
+    em: [f64; 3],
+    rr: f64,
+}
+
+/// Cached geometry of one pixel: where its ray crosses the disk, and the sky
+/// behind it (None = captured or stuck near the photon sphere - either way no
+/// sky shows). `esc` keeps the un-rotated escape direction so an orbiting
+/// camera can re-look-up the star field without re-tracing.
+#[derive(Clone, Copy)]
+struct Geo {
+    sky: Option<Sky>,
+    esc: V3,
+    n: u8,
+    cr: [Cross; 3],
+}
+
+impl Geo {
+    /// A pixel that cannot change while the camera holds still: no disk
+    /// crossings and no star to twinkle (the band is static). Its value from
+    /// the previous frame is still correct, so shading can skip it entirely.
+    fn is_static(&self) -> bool {
+        self.n == 0 && !self.sky.map_or(false, |s| s.star != [0.0, 0.0, 0.0])
+    }
+
+    fn empty() -> Geo {
+        Geo {
+            sky: None,
+            esc: V3::new(0.0, 0.0, 0.0),
+            n: 0,
+            cr: [Cross { x: 0.0, z: 0.0, om: 0.0, rr: 0.0, em: [0.0; 3] }; 3],
+        }
+    }
+}
+
+/// Geometry cache, invalidated whenever anything that bends the rays changes
+/// (frame size, zoom, tilt, shift, camera orbit angle).
+struct GeoCache {
+    key: (usize, usize, u64, u64, u64),
+    geo: Vec<Geo>,
+    /// one byte per pixel: true = can change between frames. Scanning this
+    /// instead of the 90 MB of Geo structs is what makes the skip cheap.
+    mask: Vec<bool>,
+}
+
+impl GeoCache {
+    fn new() -> GeoCache {
+        // a key no camera setup can produce
+        GeoCache { key: (0, 0, 1, 1, 1), geo: Vec::new(), mask: Vec::new() }
+    }
+}
+
+/// Integrate one ray backwards from the camera and record what the shading
+/// will need later. Time-independent by construction; `ppc0` is the ray-grid
+/// pitch in pixels per star cell, needed to size the star cores.
+fn trace_geo(cam: &Cam, dir: V3, ppc0: f64, om_max: f64, out: &mut Geo) {
     let mut p = cam.p;
     let mut v = dir;
     let h2 = p.cross(v).len2();
-    let mut col = [0.0; 3]; // HDR disk light, tone mapped at the end
-    let mut bg = [0.0; 3]; // background sky, already display referred
-    // The disk is optically thick: the near side silhouettes everything behind
-    // it, which is what carves the shadow out of the glow. Each crossing lets
-    // only a few per cent of the light from behind through.
-    let mut tr = 1.0; // remaining transmittance
     let mut a = accel(p, h2);
-    let mut steps = 0;
+    let mut tr = 1.0f64; // remaining transmittance
+    let mut n = 0u8;
+    let mut cr = [Cross { x: 0.0, z: 0.0, om: 0.0, rr: 0.0, em: [0.0; 3] }; 3];
 
-    loop {
-        steps += 1;
+    for _ in 0..MAX_STEPS {
         let r = p.len();
         if r <= RS {
             // swallowed: this pixel is the shadow
-            break;
+            *out = Geo { sky: None, esc: V3::new(0.0, 0.0, 0.0), n, cr };
+            return;
         }
         if r > ESCAPE && p.dot(v) > 0.0 {
-            bg = stars(v, t);
-            break;
-        }
-        if steps > MAX_STEPS {
-            break;
+            *out = Geo { sky: Some(stars(v, ppc0)), esc: v, n, cr };
+            return;
         }
         // adaptive step: fine near the hole, coarse far away. The cap may be
         // generous - out there the orbit is straight and only the sky lookup
@@ -360,15 +601,27 @@ fn trace(cam: &Cam, dir: V3, t: f64) -> [f64; 3] {
             let k = p.y / (p.y - pn.y);
             let hp = p + (pn - p) * k;
             let rr = (hp.x * hp.x + hp.z * hp.z).sqrt();
+            // The disk is optically thick: the near side silhouettes everything
+            // behind it, which is what carves the shadow out of the glow. Each
+            // crossing lets only a few per cent of the light from behind
+            // through, so three recorded crossings already cover everything
+            // the eye can see (the fourth would arrive at 0.01% strength).
             if rr > R_IN && rr < R_OUT {
                 let vd = (v + (vn - v) * k).norm(); // direction of travel (away from us)
-                let e = disk(rr, hp, vd, t);
-                // Grazing crossings pile an enormous projected area into a single
-                // row of pixels (the plane's horizon line) - fade those out, the
-                // way a real thin disk's photosphere limb-darkens edge-on.
-                let graze = smoothstep(0.0, 0.045, v.y.abs());
-                for i in 0..3 {
-                    col[i] += tr * e[i] * graze;
+                // Grazing crossings pile an enormous projected area into a
+                // single row of pixels - fade them the way a real thin disk's
+                // photosphere limb-darkens edge-on.
+                let graze = smoothstep(0.0, 0.045, vd.y.abs());
+                if n < 3 {
+                    let (mut em, om_raw) = disk_em(rr, hp, vd);
+                    // soft speed cap (see TURB_MAX_PX): keeps the differential
+                    // rotation but stops the inner rim from strobing
+                    let om = om_max * (om_raw / om_max).tanh();
+                    for e in em.iter_mut() {
+                        *e *= tr * graze;
+                    }
+                    cr[n as usize] = Cross { x: hp.x, z: hp.z, om, rr, em };
+                    n += 1;
                 }
                 tr *= DISK_OPA;
             }
@@ -377,7 +630,73 @@ fn trace(cam: &Cam, dir: V3, t: f64) -> [f64; 3] {
         v = vn;
         a = an;
     }
-    let c = tonemap(col);
+    // ran out of steps circling the photon sphere: no sky behind this pixel
+    *out = Geo { sky: None, esc: V3::new(0.0, 0.0, 0.0), n, cr };
+}
+
+/// Sky colour at time `t` - the twinkle is the only thing that moves.
+fn sky_rgb(s: &Sky, t: f64) -> [f64; 3] {
+    if s.star == [0.0, 0.0, 0.0] {
+        return s.band; // no star: nothing to twinkle, the pixel is static
+    }
+    let tw = 0.82 + 0.18 * tw_sin(t * s.freq + s.phase);
+    [
+        s.star[0] * tw + s.band[0],
+        s.star[1] * tw + s.band[1],
+        s.star[2] * tw + s.band[2],
+    ]
+}
+
+/// Everything a frame's shading needs, precomputed once per frame so the
+/// per-pixel loop is pure arithmetic (no transcendentals buried inside).
+struct ShCtx {
+    t: f64,
+    /// camera azimuth in radians (0 for a still camera)
+    orb: f64,
+    c: f64,
+    s: f64,
+    ppc0: f64,
+}
+
+/// Emission of one pixel at time `t` from cached geometry. This is all an
+/// animation frame pays for once the geodesics are traced: one sine per sky
+/// pixel, one noise lookup per disk crossing.
+fn shade(g: &Geo, ctx: &ShCtx) -> [f64; 3] {
+    let mut col = [0.0f64; 3]; // HDR disk light, tone mapped at the end
+    for i in 0..g.n as usize {
+        let c = &g.cr[i];
+        // Schwarzschild is axially symmetric: the geometry seen from azimuth
+        // `orb` is the azimuth-0 geometry rotated about the disk axis, so the
+        // radius, Doppler and emission are unchanged and the turbulence phase
+        // simply gains `orb`. The pattern itself lives in a pre-sampled
+        // texture (see build_turb_tex).
+        let phi = c.z.atan2(c.x) + ctx.orb - ctx.t * c.om;
+        let streak = 0.42 + 1.25 * turb(phi, c.rr);
+        col[0] += c.em[0] * streak;
+        col[1] += c.em[1] * streak;
+        col[2] += c.em[2] * streak;
+    }
+    // tonemap(0) = 0, so pure-sky pixels skip the exponentials entirely
+    let c = if g.n > 0 { tonemap(col) } else { [0.0; 3] };
+    let bg = match &g.sky {
+        Some(cached) => {
+            if ctx.orb == 0.0 {
+                sky_rgb(cached, ctx.t)
+            } else {
+                // the star field does not rotate with the camera: look it up
+                // again at the rotated escape direction (cheap - the geodesics
+                // stay cached, and the band/twinkle are reused, see
+                // stars_moved)
+                let d = V3::new(
+                    g.esc.x * ctx.c - g.esc.z * ctx.s,
+                    g.esc.y,
+                    g.esc.x * ctx.s + g.esc.z * ctx.c,
+                );
+                sky_rgb(&stars_moved(d, ctx.ppc0, cached), ctx.t)
+            }
+        }
+        None => [0.0; 3],
+    };
     [
         clamp(c[0] + bg[0], 0.0, 1.0),
         clamp(c[1] + bg[1], 0.0, 1.0),
@@ -386,12 +705,8 @@ fn trace(cam: &Cam, dir: V3, t: f64) -> [f64; 3] {
 }
 
 fn tonemap(c: [f64; 3]) -> [f64; 3] {
-    // exposure + filmic shoulder + display gamma
-    let f = |x: f64| {
-        let x = 1.0 - (-x.max(0.0) * EXPOSURE).exp();
-        x.powf(1.0 / 1.85)
-    };
-    [f(c[0]), f(c[1]), f(c[2])]
+    // exposure + filmic shoulder + display gamma, sampled (see build_tone)
+    [tone(EXPOSURE * c[0]), tone(EXPOSURE * c[1]), tone(EXPOSURE * c[2])]
 }
 
 fn lum(c: &[f64]) -> f64 {
@@ -421,6 +736,8 @@ struct Opt {
     /// emit target in device pixels (sixel) or character sub-pixels (rest)
     tpw: usize,
     tph: usize,
+    /// upper bound on rays cast per frame
+    rays: usize,
     one_shot: Option<f64>,
     ramp: Vec<char>,
 }
@@ -447,6 +764,7 @@ fn parse_opt() -> Opt {
         rows: 0,
         tpw: 0,
         tph: 0,
+        rays: RAY_BUDGET,
         one_shot: None,
         ramp: " .·:;+=*xX#%@█".chars().collect(),
     };
@@ -478,6 +796,7 @@ fn parse_opt() -> Opt {
             "--shift" => o.shift = num(&args, &mut i),
             "--cols" => o.cols = num(&args, &mut i) as usize,
             "--rows" => o.rows = num(&args, &mut i) as usize,
+            "--rays" => o.rays = num(&args, &mut i).clamp(40_000.0, 4_000_000.0) as usize,
             "--frame" => o.one_shot = Some(num(&args, &mut i)),
             "--no-color" | "--ascii-only" => o.color = false,
             _ => {
@@ -498,6 +817,9 @@ fn parse_opt() -> Opt {
     }
     if o.shift.is_nan() {
         o.shift = 0.0;
+    }
+    if o.rays == 0 {
+        o.rays = RAY_BUDGET;
     }
     let (c, r) = term_size();
     if o.cols == 0 {
@@ -543,6 +865,8 @@ OPTIONS
       --shift <n>       move the picture up (+) / down (-), half-frame units
       --cols <n>        override terminal width
       --rows <n>        override terminal height
+      --rays <n>        ray budget per frame (default 200000); lower = faster
+                        and coarser, higher = sharper and slower
       --frame <n>       render a single frame at time n/fps and exit
       --no-color        no ANSI colours (pure ASCII output, good for pipes)
 
@@ -685,15 +1009,30 @@ struct Frame {
 /// (device-pixel sized) from costing seconds each.
 const RAY_BUDGET: usize = 200_000;
 
-fn render_frame(o: &Opt, t: f64) -> Frame {
-    let s = (RAY_BUDGET as f64 / (o.tpw as f64 * o.tph as f64))
+/// Renders into `f`, reusing its pixel buffer between frames - a sixel frame
+/// is a 14 MB allocation and re-allocating it every frame shows.
+fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache) {
+    let s = (o.rays as f64 / (o.tpw as f64 * o.tph as f64))
         .min(1.0)
         .sqrt();
     let w = ((o.tpw as f64 * s).round() as usize).max(80);
     let h = ((o.tph as f64 * s).round() as usize).max(40);
-    let mut px = vec![[0.0f64; 3]; w * h];
-    let orbit = o.orbit.to_radians() * t; // radians per second
-    let cam = Cam::new(orbit, o.tilt.to_radians());
+    f.w = w;
+    f.h = h;
+    // keep the previous frame's pixels: every shaded pixel is overwritten and
+    // static ones (see below) rely on their old value being still there.
+    // Re-zeroing 8 MB per frame was pure waste.
+    let resized = f.px.len() != w * h;
+    if resized {
+        f.px.clear();
+        f.px.resize(w * h, [0.0; 3]);
+    }
+    let px = &mut f.px;
+    let orbit = o.orbit.to_radians() * t; // camera azimuth right now
+    // The camera may orbit, but the hole is axially symmetric: geometry is
+    // traced once at azimuth zero and shaded at the current azimuth (see
+    // `shade`), so an orbiting camera never pays for a re-trace.
+    let cam = Cam::new(0.0, o.tilt.to_radians());
     let zoom = o.zoom;
     let shift = o.shift;
 
@@ -701,38 +1040,130 @@ fn render_frame(o: &Opt, t: f64) -> Frame {
         .map(|n| n.get())
         .unwrap_or(1)
         .clamp(1, 32);
+    // Small frames run faster on a single thread: spawning a worker costs
+    // more than the shading it would do.
+    let par = nthreads > 1 && w * h >= 96_000;
     let rows_per = (h + nthreads - 1) / nthreads;
-    thread::scope(|sc| {
-        for (n, band) in px.chunks_mut(rows_per * w).enumerate() {
-            sc.spawn(move || {
-                let y0 = n * rows_per;
-                for (j, row) in band.chunks_mut(w).enumerate() {
-                    let y = y0 + j;
-                    for (x, pxl) in row.iter_mut().enumerate() {
-                        let dir = cam.ray(x, y, w, h, zoom, shift);
-                        *pxl = trace(&cam, dir, t);
-                    }
+
+    // pixels per star cell at layer 0: w pixels span 2*atan(VIEW/zoom*aspect)
+    // radians, a layer-0 cell is 1/STAR_SCALE[0] radians wide
+    let aspect = w as f64 / h as f64;
+    let fov = 2.0 * (VIEW / zoom * aspect).atan();
+    let ppc0 = w as f64 / (fov * STAR_SCALE[0]);
+    let om_max = TURB_MAX_PX * fov / o.tpw as f64;
+
+    // I-frame: full geodesic pass, only when the camera setup changes. The
+    // orbit is deliberately absent from the key: rotation of the view is
+    // handled in the shading, not by moving the camera.
+    let key = (w, h, zoom.to_bits(), o.tilt.to_bits(), shift.to_bits());
+    let mut invalidated = false;
+    if cache.key != key || cache.geo.len() != w * h {
+        invalidated = true;
+        cache.key = key;
+        // same reuse story as the pixel buffer: a stable-size re-trace (zoom)
+        // overwrites every entry anyway
+        if cache.geo.len() != w * h {
+            cache.geo.clear();
+            cache.geo.resize_with(w * h, Geo::empty);
+            cache.mask.clear();
+            cache.mask.resize(w * h, false);
+        }
+        let geo = &mut cache.geo;
+        let mask = &mut cache.mask;
+        if par {
+            thread::scope(|sc| {
+                for (n, (band, mband)) in geo
+                    .chunks_mut(rows_per * w)
+                    .zip(mask.chunks_mut(rows_per * w))
+                    .enumerate()
+                {
+                    let cam = &cam;
+                    sc.spawn(move || {
+                        let y0 = n * rows_per;
+                        for (j, (rowgeo, rowmask)) in band
+                            .chunks_mut(w)
+                            .zip(mband.chunks_mut(w))
+                            .enumerate()
+                        {
+                            let y = y0 + j;
+                            for (x, (g, m)) in rowgeo
+                                .iter_mut()
+                                .zip(rowmask.iter_mut())
+                                .enumerate()
+                            {
+                                let dir = cam.ray(x, y, w, h, zoom, shift);
+                                trace_geo(&cam, dir, ppc0, om_max, g);
+                                // remember which pixels can ever change - the
+                                // P-frames scan this byte mask instead of
+                                // streaming the whole geometry cache
+                                *m = !g.is_static();
+                            }
+                        }
+                    });
                 }
             });
+        } else {
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    let dir = cam.ray(x, y, w, h, zoom, shift);
+                    trace_geo(&cam, dir, ppc0, om_max, &mut geo[i]);
+                    mask[i] = !geo[i].is_static();
+                }
+            }
         }
-    });
-    Frame { w, h, px }
-}
-
-fn colour(o: &Opt, out: &mut String, c: &[f64]) {
-    if !o.color {
-        return;
     }
-    let r = (c[0] * 255.0) as u32;
-    let g = (c[1] * 255.0) as u32;
-    let b = (c[2] * 255.0) as u32;
-    out.push_str("\x1b[38;2;");
-    push_u32(out, r);
-    out.push(';');
-    push_u32(out, g);
-    out.push(';');
-    push_u32(out, b);
-    out.push('m');
+
+    // P-frame: re-shade the cached geometry for the current time and azimuth.
+    // The one-off sample tables are wanted by the shading (and by nothing
+    // else), so they are built here, once.
+    if TURB_TEX.get().is_none() {
+        build_turb_tex();
+    }
+    if TONE.get().is_none() {
+        build_tone();
+    }
+    let ctx = ShCtx { t, orb: orbit, c: orbit.cos(), s: orbit.sin(), ppc0 };
+    // pixels that cannot change (no disk, no star, still camera) keep their
+    // previous value; on the first frame or after a re-trace everything is
+    // shaded so the buffer is fully written. The mask carries the decision
+    // so this pass streams 320 KB, not the whole geometry cache.
+    let skip_static = !invalidated && !resized && orbit == 0.0;
+    let geo = &cache.geo;
+    if par {
+        thread::scope(|sc| {
+            for (n, band) in px.chunks_mut(rows_per * w).enumerate() {
+                let src = &geo[n * rows_per * w..];
+                let mband = &cache.mask[n * rows_per * w..];
+                let ctx = &ctx;
+                sc.spawn(move || {
+                    if skip_static {
+                        for ((p, m), g) in band.iter_mut().zip(mband).zip(src) {
+                            if !*m {
+                                continue;
+                            }
+                            *p = shade(g, ctx);
+                        }
+                    } else {
+                        for (p, g) in band.iter_mut().zip(src) {
+                            *p = shade(g, ctx);
+                        }
+                    }
+                });
+            }
+        });
+    } else if skip_static {
+        for ((p, m), g) in px.iter_mut().zip(cache.mask.iter()).zip(geo.iter()) {
+            if !*m {
+                continue;
+            }
+            *p = shade(g, &ctx);
+        }
+    } else {
+        for (p, g) in px.iter_mut().zip(geo.iter()) {
+            *p = shade(g, &ctx);
+        }
+    }
 }
 
 fn push_u32(out: &mut String, mut v: u32) {
@@ -752,10 +1183,127 @@ fn push_u32(out: &mut String, mut v: u32) {
     }
 }
 
-fn draw_ascii(o: &Opt, f: &Frame, out: &mut String) {
+// -------------------------------------------------------- incremental UI
+//
+// The classic fast-terminal recipe (see e.g. Andrew Kelley's `tcout` demo):
+// never hand the terminal a whole screen per frame. Keep the previous frame's
+// cells, send only what changed, in runs, with a colour set only when it
+// actually changes, and push it all with a single write(). A naive full
+// repaint with SGR + reset per cell costs ~25 bytes per cell and makes the
+// terminal, not the renderer, the bottleneck.
+
+#[derive(Clone, PartialEq)]
+struct Cell {
+    ch: char,
+    rgb: [u8; 3],
+}
+
+struct Screen {
+    prev: Vec<Cell>,
+    w: usize,
+    h: usize,
+}
+
+impl Screen {
+    fn new() -> Screen {
+        Screen { prev: Vec::new(), w: 0, h: 0 }
+    }
+
+    /// Append the shortest byte sequence that turns the screen from `prev`
+    /// into `cells` (a `cw` x `chh` grid, row major). With `o.color` off no SGR
+    /// is emitted at all and colours take no part in the diff.
+    fn emit(&mut self, o: &Opt, cells: &[Cell], cw: usize, chh: usize, out: &mut String) {
+        let full = cw != self.w || chh != self.h || cells.len() != self.prev.len();
+        let mut cur: Option<[u8; 3]> = None; // colour the terminal is in now
+        if full {
+            for y in 0..chh {
+                for x in 0..cw {
+                    let c = &cells[y * cw + x];
+                    set_colour(o, out, &mut cur, c.rgb);
+                    out.push(c.ch);
+                }
+                if y + 1 < chh {
+                    out.push_str("\r\n");
+                }
+            }
+        } else {
+            for y in 0..chh {
+                let row = y * cw;
+                let mut x = 0;
+                while x < cw {
+                    if cells[row + x] == self.prev[row + x] {
+                        x += 1;
+                        continue;
+                    }
+                    // changed run start: extend it over gaps of a few equal
+                    // cells - re-addressing the cursor costs about as much as
+                    // rewriting three cells
+                    let mut end = x + 1;
+                    let mut gap = 0;
+                    let mut j = x + 1;
+                    while j < cw {
+                        if cells[row + j] != self.prev[row + j] {
+                            end = j + 1;
+                            gap = 0;
+                        } else {
+                            gap += 1;
+                            if gap > 3 {
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    out.push_str("\x1b[");
+                    push_u32(out, (y + 1) as u32);
+                    out.push(';');
+                    push_u32(out, (x + 1) as u32);
+                    out.push('H');
+                    for c in &cells[row + x..row + end] {
+                        set_colour(o, out, &mut cur, c.rgb);
+                        out.push(c.ch);
+                    }
+                    x = end;
+                }
+            }
+        }
+        if o.color {
+            out.push_str("\x1b[0m");
+        }
+        self.prev = cells.to_vec();
+        self.w = cw;
+        self.h = chh;
+    }
+}
+
+fn set_colour(o: &Opt, out: &mut String, cur: &mut Option<[u8; 3]>, rgb: [u8; 3]) {
+    if !o.color || *cur == Some(rgb) {
+        return;
+    }
+    out.push_str("\x1b[38;2;");
+    push_u32(out, rgb[0] as u32);
+    out.push(';');
+    push_u32(out, rgb[1] as u32);
+    out.push(';');
+    push_u32(out, rgb[2] as u32);
+    out.push('m');
+    *cur = Some(rgb);
+}
+
+/// Cell colour, quantised to 32 levels per channel: fewer SGR switches, and
+/// tiny float wobble between frames no longer counts as a change.
+fn cell_rgb(o: &Opt, c: &[f64]) -> [u8; 3] {
+    if !o.color {
+        return [0, 0, 0];
+    }
+    let q = |x: f64| (((x.max(0.0) * 31.0).round() as u8).min(31)) * 8;
+    [q(c[0]), q(c[1]), q(c[2])]
+}
+
+fn draw_ascii(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
     let ramp = &o.ramp;
     let cw = f.w / SUB_X;
     let ch = f.h / SUB_Y;
+    let mut cells = Vec::with_capacity(cw * ch);
     for cy in 0..ch {
         for cx in 0..cw {
             let mut acc = [0.0; 3];
@@ -771,16 +1319,10 @@ fn draw_ascii(o: &Opt, f: &Frame, out: &mut String) {
             let c = [acc[0] / n, acc[1] / n, acc[2] / n];
             let l = lum(&c);
             let idx = ((ramp.len() - 1) as f64 * l).round() as usize;
-            colour(o, out, &c);
-            out.push(ramp[idx]);
-            if o.color {
-                out.push_str("\x1b[0m");
-            }
-        }
-        if cy + 1 < ch {
-            out.push_str("\r\n");
+            cells.push(Cell { ch: ramp[idx], rgb: cell_rgb(o, &c) });
         }
     }
+    scr.emit(o, &cells, cw, ch, out);
 }
 
 fn dot_bit(sx: usize, sy: usize) -> u8 {
@@ -796,9 +1338,10 @@ fn dot_bit(sx: usize, sy: usize) -> u8 {
     }
 }
 
-fn draw_braille(o: &Opt, f: &Frame, out: &mut String) {
+fn draw_braille(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
     let cw = f.w / SUB_X;
     let ch = f.h / SUB_Y;
+    let mut cells = Vec::with_capacity(cw * ch);
     for cy in 0..ch {
         for cx in 0..cw {
             let mut acc = [0.0; 3];
@@ -832,17 +1375,17 @@ fn draw_braille(o: &Opt, f: &Frame, out: &mut String) {
             if bits == 0 && l > 0.03 {
                 bits = dot_bit(0, 0);
             }
-            colour(o, out, &c);
-            out.push(char::from_u32(0x2800 + bits as u32).unwrap_or(' '));
-            if o.color {
-                out.push_str("\x1b[0m");
-            }
-        }
-        if cy + 1 < ch {
-            out.push_str("\r\n");
+            let ch4 = char::from_u32(0x2800 + bits as u32).unwrap_or(' ');
+            cells.push(Cell { ch: ch4, rgb: cell_rgb(o, &c) });
         }
     }
+    scr.emit(o, &cells, cw, ch, out);
 }
+
+/// Sixel sky cutoff: pixels dimmer than this are dropped outright. The faint
+/// specks it removes are near-invisible but each one costs a colour strip and
+/// broken run-length compression in every band it touches.
+const SIXEL_SKY_CUT: f64 = 0.17;
 
 fn draw_sixel(o: &Opt, f: &Frame, out: &mut String) {
     // Sixel paints device pixels, so map the ray grid up to the target size
@@ -855,6 +1398,23 @@ fn draw_sixel(o: &Opt, f: &Frame, out: &mut String) {
         col[x] = x * f.w / tw.max(1);
     }
 
+    // Quantise every source pixel to its cube register once (255 = dropped =
+    // sky). Two kinds of sky detail are pure waste and get cut here:
+    //  - pixels that land in the black register anyway (level 0 in every
+    //    channel) - they would paint black over the black underlay;
+    //  - anything dimmer than SIXEL_SKY_CUT: specks that are barely visible
+    //    yet each one opens a colour strip and shreds the RLE runs of the
+    //    whole band.
+    let mut idx_map = vec![255u8; f.w * f.h];
+    for (p, q) in f.px.iter().zip(idx_map.iter_mut()) {
+        if lum(p) >= SIXEL_SKY_CUT {
+            let i = pixel_index(p);
+            if i != 0 {
+                *q = i as u8;
+            }
+        }
+    }
+
     // register 0 = black, registers 16..231 = a 6x6x6 colour cube.
     //
     // Registers use the RGB form `#idx;2;r;g;b` with components in per cent
@@ -862,8 +1422,10 @@ fn draw_sixel(o: &Opt, f: &Frame, out: &mut String) {
     // `#idx;r;g;b` makes a strict parser read r as the colourspace and throw the
     // whole image away, and components above 100 are rejected just as loudly.
     let mut used = [false; 216];
-    for p in &f.px {
-        used[pixel_index(p)] = true;
+    for &q in &idx_map {
+        if q != 255 {
+            used[q as usize] = true;
+        }
     }
     out.push_str("\x1bPq#0;2;0;0;0");
     for b in 0..6usize {
@@ -886,23 +1448,37 @@ fn draw_sixel(o: &Opt, f: &Frame, out: &mut String) {
 
     let bands = (th + 5) / 6;
     let mut row: Vec<u8> = vec![0; tw];
-    let mut strip: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+    // one reusable strip buffer per cube colour + the list of colours in use:
+    // building a map per band (and allocating a mask per strip) costs more
+    // than the encoding itself
+    let mut strips: Vec<Vec<u8>> = (0..216).map(|_| Vec::new()).collect();
+    let mut seen = [false; 216];
+    let mut used_cols: Vec<usize> = Vec::new();
     for band in 0..bands {
-        strip.clear();
+        for &c in &used_cols {
+            seen[c] = false;
+        }
+        used_cols.clear();
         for sy in 0..6usize {
             let ty = band * 6 + sy;
             if ty >= th {
                 break;
             }
             let y = ty * f.h / th.max(1);
+            let srow = &idx_map[y * f.w..(y + 1) * f.w];
             for x in 0..tw {
-                let p = f.px[y * f.w + col[x]];
-                if lum(&p) < 0.02 {
+                let q = srow[col[x]];
+                if q == 255 {
                     continue;
                 }
-                let idx = pixel_index(&p);
-                let e = strip.entry(idx).or_insert_with(|| vec![0; tw]);
-                e[x] |= 1 << sy;
+                let idx = q as usize;
+                if !seen[idx] {
+                    seen[idx] = true;
+                    used_cols.push(idx);
+                    strips[idx].clear();
+                    strips[idx].resize(tw, 0);
+                }
+                strips[idx][x] |= 1 << sy;
             }
         }
         // opaque black background first so nothing of the previous frame leaks
@@ -910,10 +1486,10 @@ fn draw_sixel(o: &Opt, f: &Frame, out: &mut String) {
         out.push_str("#0");
         write_row(out, &row);
         out.push('$');
-        for (idx, mask) in strip.iter() {
+        for idx in used_cols.iter() {
             out.push('#');
             push_u32(out, (16 + idx) as u32);
-            write_row(out, mask);
+            write_row(out, &strips[*idx]);
             // `$` rewinds to the left edge of the band: without it the next
             // colour strip would be drawn to the right of this one.
             out.push('$');
@@ -962,8 +1538,11 @@ fn main() {
 
     if let Some(n) = o.one_shot {
         let t = n / o.fps * o.speed;
-        let f = render_frame(&o, t);
-        draw_into(&o, &f, &mut out);
+        let mut f = Frame { w: 0, h: 0, px: Vec::new() };
+        let mut cache = GeoCache::new();
+        render_frame(&o, t, &mut f, &mut cache);
+        let mut scr = Screen::new();
+        draw_into(&o, &f, &mut out, &mut scr);
         println!("{out}");
         return;
     }
@@ -975,6 +1554,10 @@ fn main() {
 
     let mut t = 0.0;
     let mut paused = false;
+    let mut drawn = false; // a paused, up-to-date frame needs no work at all
+    let mut scr = Screen::new();
+    let mut f = Frame { w: 0, h: 0, px: Vec::new() };
+    let mut cache = GeoCache::new();
     let mut last = Instant::now();
     loop {
         let step = last.elapsed().as_secs_f64();
@@ -982,12 +1565,15 @@ fn main() {
         if !paused {
             t += step * o.speed;
         }
-        let f = render_frame(&o, t);
-        out.clear();
-        out.push_str("\x1b[H");
-        draw_into(&o, &f, &mut out);
-        let _ = so.write_all(out.as_bytes());
-        let _ = so.flush();
+        if !paused || !drawn {
+            render_frame(&o, t, &mut f, &mut cache);
+            out.clear();
+            out.push_str("\x1b[H");
+            draw_into(&o, &f, &mut out, &mut scr);
+            let _ = so.write_all(out.as_bytes());
+            let _ = so.flush();
+            drawn = true;
+        }
 
         // frame pacing (also lets us stay responsive on slow terminals)
         let budget = Duration::from_secs_f64(1.0 / o.fps);
@@ -998,8 +1584,14 @@ fn main() {
             match k {
                 'q' | '\x1b' | 'c' => break,
                 ' ' => paused = !paused,
-                '+' | '=' => o.zoom = (o.zoom * 1.15).clamp(0.25, 6.0),
-                '-' | '_' => o.zoom = (o.zoom / 1.15).clamp(0.25, 6.0),
+                '+' | '=' => {
+                    o.zoom = (o.zoom * 1.15).clamp(0.25, 6.0);
+                    drawn = false;
+                }
+                '-' | '_' => {
+                    o.zoom = (o.zoom / 1.15).clamp(0.25, 6.0);
+                    drawn = false;
+                }
                 _ => {}
             }
         }
@@ -1008,10 +1600,10 @@ fn main() {
     let _ = so.flush();
 }
 
-fn draw_into(o: &Opt, f: &Frame, out: &mut String) {
+fn draw_into(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
     match o.mode {
-        Mode::Ascii => draw_ascii(o, f, out),
-        Mode::Braille => draw_braille(o, f, out),
+        Mode::Ascii => draw_ascii(o, f, out, scr),
+        Mode::Braille => draw_braille(o, f, out, scr),
         Mode::Sixel => draw_sixel(o, f, out),
     }
 }
