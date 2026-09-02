@@ -618,6 +618,7 @@ const STREAM_LIFE: f64 = 6.0;
 const STREAM_MAX: usize = 24;
 const STREAM_BRI: f64 = 6.0;
 const STREAM_SIG: f64 = 0.45;
+const MATTER_STEP: f64 = 0.02;
 
 /// One glowing point of the stream, in the trace (camera-azimuth-0) frame,
 /// its colour already weighted: head hot and bright, trail dim and red,
@@ -1070,10 +1071,13 @@ impl Stream {
     /// carrying the mass it still had if the hole swallowed it (0.0 if
     /// it merely cooled off).
     fn advance(&mut self, mut dt: f64, gm: f64) -> Option<f64> {
-        self.age += dt;
-        if self.age > STREAM_LIFE {
+        let remaining = STREAM_LIFE - self.age;
+        if remaining <= 0.0 {
             return Some(0.0);
         }
+        let cooled = dt >= remaining;
+        dt = dt.min(remaining);
+        self.age += dt;
         while dt > 1e-9 {
             let r = self.p.len();
             let h = (if r < 3.0_f64 { 0.004_f64 } else { 0.02_f64 }).min(dt);
@@ -1085,7 +1089,7 @@ impl Stream {
                 return Some(self.w);
             }
         }
-        None
+        cooled.then_some(0.0)
     }
 }
 
@@ -1161,43 +1165,52 @@ impl Stars {
     /// Advance every star and stream; each star that crosses the horizon
     /// plants a remnant glow where it died, and each swallowed stream
     /// leaves the hole that much heavier.
-    fn advance(&mut self, dt: f64) {
-        let gm = INFALL_GM * (1.0 + self.m_acc);
-        let mut i = 0;
-        while i < self.live.len() {
-            let was_alive = self.live[i].alive;
-            let keep = self.live[i].advance(dt, gm, &mut self.streams);
-            if was_alive && !self.live[i].alive {
-                let inf = &self.live[i];
-                let r = inf.p.len();
-                let p = if r > 1e-9 {
-                    inf.p * (1.6 / r)
-                } else {
-                    V3::new(1.6, 0.0, 0.0)
-                };
-                self.rem = Some((p, 1.0, inf.sc * inf.m.cbrt()));
-            }
-            if keep {
-                i += 1;
-            } else {
-                self.live.remove(i);
-            }
-        }
-        let mut i = 0;
-        while i < self.streams.len() {
-            match self.streams[i].advance(dt, gm) {
-                None => i += 1,
-                Some(w) => {
-                    self.m_acc = (self.m_acc + w).min(2.0);
-                    self.streams.remove(i);
+    fn advance(&mut self, mut dt: f64) {
+        while dt > 1e-9 {
+            let h = dt.min(MATTER_STEP);
+            let gm = INFALL_GM * (1.0 + self.m_acc);
+
+            // Advance streams and existing remnants before stars. Material or
+            // remnants created by a star during this slice therefore start at
+            // the slice boundary instead of being aged by time before birth.
+            let mut i = 0;
+            while i < self.streams.len() {
+                match self.streams[i].advance(h, gm) {
+                    None => i += 1,
+                    Some(w) => {
+                        self.m_acc = (self.m_acc + w).min(2.0);
+                        self.streams.remove(i);
+                    }
                 }
             }
-        }
-        if let Some((_, b, _)) = self.rem.as_mut() {
-            *b *= (-dt / (INFALL_FADE * 0.35)).exp();
-        }
-        if self.rem.is_some_and(|(_, b, _)| b < 0.02) {
-            self.rem = None;
+            if let Some((_, b, _)) = self.rem.as_mut() {
+                *b *= (-h / (INFALL_FADE * 0.35)).exp();
+            }
+            if self.rem.is_some_and(|(_, b, _)| b < 0.02) {
+                self.rem = None;
+            }
+
+            let mut i = 0;
+            while i < self.live.len() {
+                let was_alive = self.live[i].alive;
+                let keep = self.live[i].advance(h, gm, &mut self.streams);
+                if was_alive && !self.live[i].alive {
+                    let inf = &self.live[i];
+                    let r = inf.p.len();
+                    let p = if r > 1e-9 {
+                        inf.p * (1.6 / r)
+                    } else {
+                        V3::new(1.6, 0.0, 0.0)
+                    };
+                    self.rem = Some((p, 1.0, inf.sc * inf.m.cbrt()));
+                }
+                if keep {
+                    i += 1;
+                } else {
+                    self.live.remove(i);
+                }
+            }
+            dt -= h;
         }
     }
 }
@@ -2579,7 +2592,7 @@ fn main() {
 
     if let Some(n) = o.one_shot {
         let t = n / o.fps * o.speed;
-        o.azi = o.orbit.to_radians() * t;
+        let final_azi = o.orbit.to_radians() * t;
         let mut f = Frame {
             w: 0,
             h: 0,
@@ -2591,6 +2604,7 @@ fn main() {
             stars.spawn(o.big_star, &o);
             stars.advance(t);
         }
+        o.azi = final_azi;
         let glows = glow_list(&stars, o.azi);
         render_frame(&o, t, &mut f, &mut cache, &glows);
         let mut scr = Screen::new();
@@ -2708,6 +2722,51 @@ fn draw_into(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
 mod tests {
     use super::*;
 
+    fn test_stars(sc: f64, speed: f64, p: V3) -> Stars {
+        let mut stars = Stars::new();
+        let d = p.norm();
+        let a = V3::new(-d.y, d.x, 0.0).norm();
+        stars.live.push(Infall::spawn(
+            1,
+            sc,
+            INFALL_GM,
+            d,
+            a,
+            V3::new(0.0, 0.0, 1.0),
+            Some(speed),
+        ));
+        stars
+    }
+
+    fn evolve(mut stars: Stars, total: f64, step: f64) -> Stars {
+        let mut elapsed = 0.0;
+        while elapsed < total - 1e-12 {
+            let h = step.min(total - elapsed);
+            stars.advance(h);
+            elapsed += h;
+        }
+        stars
+    }
+
+    fn stripping_stars() -> Stars {
+        let p = V3::new(2.2, 0.0, 0.0);
+        let v = V3::new(0.0, 2.5, 0.0);
+        let mut stars = Stars::new();
+        stars.live.push(Infall {
+            p,
+            v,
+            tr: vec![Trail::shed(p, v)],
+            tr_at: p,
+            alive: true,
+            sc: 3.0,
+            m: 1.0,
+            drag: BIG_DRAG,
+            ns: 0,
+            debt: 0.0,
+        });
+        stars
+    }
+
     #[test]
     fn empty_glow_frame_clears_previous_deposition() {
         let mut geo = vec![Geo::empty()];
@@ -2729,6 +2788,30 @@ mod tests {
 
         assert!(trail.advance(2.0, INFALL_GM));
         assert!(trail.p.len() < p.len());
+    }
+
+    #[test]
+    fn large_time_jump_does_not_pre_age_a_remnant() {
+        let one_jump = evolve(test_stars(1.0, 0.72, V3::new(1.0, 0.0, 0.0)), 20.0, 20.0);
+        let many_frames = evolve(
+            test_stars(1.0, 0.72, V3::new(1.0, 0.0, 0.0)),
+            20.0,
+            1.0 / 120.0,
+        );
+        let one_brightness = one_jump.rem.expect("one-jump remnant").1;
+        let frame_brightness = many_frames.rem.expect("frame-step remnant").1;
+
+        assert!(one_brightness > 0.8);
+        assert!((one_brightness - frame_brightness).abs() < 0.05);
+    }
+
+    #[test]
+    fn large_time_jump_does_not_expire_new_streams() {
+        let one_jump = evolve(stripping_stars(), 8.0, 8.0);
+        let many_frames = evolve(stripping_stars(), 8.0, 1.0 / 120.0);
+
+        assert!(one_jump.m_acc > 0.0);
+        assert!((one_jump.m_acc - many_frames.m_acc).abs() < 0.03);
     }
 
     #[test]
