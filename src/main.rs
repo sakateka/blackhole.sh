@@ -407,6 +407,86 @@ fn band_w(ay: f64) -> f64 {
     t[i] * (1.0 - a) + t[i + 1] * a
 }
 
+const BAND_FACE_N: usize = 128;
+static BAND_TEX: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn band_exact(d: V3) -> f64 {
+    let band = if d.y.abs() < 0.75 {
+        band_w(d.y.abs())
+    } else {
+        0.0
+    };
+    if band > 1e-3 {
+        band * band_noise(d)
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn band_noise(d: V3) -> f64 {
+    0.4 + 1.2 * fbm3(d.x * 3.0 + 11.0, d.y * 3.0, d.z * 3.0 - 7.0)
+}
+
+#[inline]
+fn band_face(d: V3) -> (usize, f64, f64) {
+    let (ax, ay, az) = (d.x.abs(), d.y.abs(), d.z.abs());
+    if ax >= ay && ax >= az {
+        (usize::from(d.x < 0.0), d.y / ax, d.z / ax)
+    } else if ay >= az {
+        (2 + usize::from(d.y < 0.0), d.x / ay, d.z / ay)
+    } else {
+        (4 + usize::from(d.z < 0.0), d.x / az, d.y / az)
+    }
+}
+
+fn build_band_tex() -> Vec<f32> {
+    let side = BAND_FACE_N + 1;
+    let mut tex = vec![0.0; 6 * side * side];
+    for face in 0..6 {
+        let sign = if face & 1 == 0 { 1.0 } else { -1.0 };
+        for y in 0..side {
+            let v = y as f64 / BAND_FACE_N as f64 * 2.0 - 1.0;
+            for x in 0..side {
+                let u = x as f64 / BAND_FACE_N as f64 * 2.0 - 1.0;
+                let d = match face / 2 {
+                    0 => V3::new(sign, u, v),
+                    1 => V3::new(u, sign, v),
+                    _ => V3::new(u, v, sign),
+                }
+                .norm();
+                tex[face * side * side + y * side + x] = band_noise(d) as f32;
+            }
+        }
+    }
+    tex
+}
+
+#[inline]
+fn band_sample(d: V3) -> f64 {
+    let band = if d.y.abs() < 0.75 {
+        band_w(d.y.abs())
+    } else {
+        0.0
+    };
+    if band <= 1e-3 {
+        return 0.0;
+    }
+    let tex = BAND_TEX.get_or_init(build_band_tex);
+    let (face, u, v) = band_face(d);
+    let side = BAND_FACE_N + 1;
+    let fx = ((u + 1.0) * 0.5 * BAND_FACE_N as f64).clamp(0.0, BAND_FACE_N as f64);
+    let fy = ((v + 1.0) * 0.5 * BAND_FACE_N as f64).clamp(0.0, BAND_FACE_N as f64);
+    let x = (fx as usize).min(BAND_FACE_N - 1);
+    let y = (fy as usize).min(BAND_FACE_N - 1);
+    let (tx, ty) = (fx - x as f64, fy - y as f64);
+    let i = face * side * side + y * side + x;
+    let a = tex[i] as f64 + (tex[i + 1] as f64 - tex[i] as f64) * tx;
+    let b = tex[i + side] as f64 + (tex[i + side + 1] as f64 - tex[i + side] as f64) * tx;
+    band * (a + (b - a) * ty)
+}
+
 /// Star contribution (at twinkle = 1) and its twinkle parameters.
 fn star_layer(d: V3, ppc0: f64) -> ([f64; 3], f64, f64) {
     let mut lum = 0.0;
@@ -456,36 +536,14 @@ fn star_layer(d: V3, ppc0: f64) -> ([f64; 3], f64, f64) {
 
 fn stars(d: V3, ppc0: f64) -> Sky {
     let (star, freq, phase) = star_layer(d, ppc0);
-    // whisper of a galactic band so the void is not perfectly flat; it is a
-    // function of d.y alone, so a yawing camera leaves it untouched
-    let band = if d.y.abs() < 0.75 {
-        band_w(d.y.abs())
-    } else {
-        0.0
-    };
-    let g = if band > 1e-3 {
-        band * (0.4 + 1.2 * fbm3(d.x * 3.0 + 11.0, d.y * 3.0, d.z * 3.0 - 7.0))
-    } else {
-        0.0
-    };
+    // World-fixed galactic band. A small cube map keeps orbiting-camera
+    // lookups cheap while preserving its longitudinal fbm texture.
+    let g = band_sample(d);
     Sky {
         star,
         band: [g * 0.7, g * 0.8, g],
         freq,
         phase,
-    }
-}
-
-/// Sky for an orbiting camera: only the star positions move. The band is
-/// exactly invariant under yaw (it depends on d.y alone) and the twinkle
-/// parameters belong to the pixel's neighbourhood, so both are reused.
-fn stars_moved(d: V3, ppc0: f64, cached: &Sky) -> Sky {
-    let (star, _, _) = star_layer(d, ppc0);
-    Sky {
-        star,
-        band: cached.band,
-        freq: cached.freq,
-        phase: cached.phase,
     }
 }
 
@@ -1469,14 +1527,13 @@ fn shade(g: &Geo, ctx: &ShCtx) -> [f64; 3] {
             } else {
                 // the star field does not rotate with the camera: look it up
                 // again at the rotated escape direction (cheap - the geodesics
-                // stay cached, and the band/twinkle are reused, see
-                // stars_moved)
+                // stay cached)
                 let d = V3::new(
                     g.esc.x * ctx.c - g.esc.z * ctx.s,
                     g.esc.y,
                     g.esc.x * ctx.s + g.esc.z * ctx.c,
                 );
-                sky_rgb(&stars_moved(d, ctx.ppc0, cached), ctx.t)
+                sky_rgb(&stars(d, ctx.ppc0), ctx.t)
             }
         }
         None => [0.0; 3],
@@ -2700,6 +2757,58 @@ mod tests {
 
         assert!(geo.sky.is_some());
         assert!((geo.esc.len() - 1.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn orbiting_sky_matches_a_full_lookup() {
+        let esc = V3::new(0.31, -0.27, 0.91).norm();
+        let orb = 0.73_f64;
+        let ctx = ShCtx {
+            t: 1.2345,
+            orb,
+            c: orb.cos(),
+            s: orb.sin(),
+            ppc0: 3.0,
+        };
+        let mut geo = Geo::empty();
+        geo.sky = Some(stars(esc, ctx.ppc0));
+        geo.esc = esc;
+        let d = V3::new(
+            esc.x * ctx.c - esc.z * ctx.s,
+            esc.y,
+            esc.x * ctx.s + esc.z * ctx.c,
+        );
+        let mut expected = sky_rgb(&stars(d, ctx.ppc0), ctx.t);
+        for channel in &mut expected {
+            *channel = channel.clamp(0.0, 1.0);
+        }
+
+        assert_eq!(shade(&geo, &ctx), expected);
+    }
+
+    #[test]
+    fn galactic_band_texture_tracks_procedural_field() {
+        let mut max_error = 0.0_f64;
+        let mut total_error = 0.0_f64;
+        let mut samples = 0usize;
+        for yi in 0..81 {
+            let y = -0.74 + 1.48 * yi as f64 / 80.0;
+            let xz = (1.0 - y * y).sqrt();
+            for ai in 0..256 {
+                let a = TAU * ai as f64 / 256.0;
+                let d = V3::new(xz * a.cos(), y, xz * a.sin());
+                let error = (band_sample(d) - band_exact(d)).abs();
+                max_error = max_error.max(error);
+                total_error += error;
+                samples += 1;
+            }
+        }
+
+        let mean_error = total_error / samples as f64;
+        assert!(
+            max_error < 1e-4 && mean_error < 1e-5,
+            "band error: max={max_error}, mean={mean_error}"
+        );
     }
 
     #[test]
