@@ -1271,6 +1271,10 @@ struct Stars {
     /// remaining brightness and its (mass-shrunk) glow scale
     rem: Vec<Remnant>,
     seed: i64,
+    /// superstar mode: a swallowed stream parcel plants one small flash of
+    /// the same kind, so the accretion end of the bridge flickers as the
+    /// hole drinks
+    feed: bool,
 }
 
 impl Stars {
@@ -1280,6 +1284,7 @@ impl Stars {
             streams: Vec::new(),
             rem: Vec::new(),
             seed: 0,
+            feed: false,
         }
     }
 
@@ -1341,12 +1346,14 @@ impl Stars {
             debt: 0.0,
             parked: true,
         });
+        self.feed = true;
     }
 
     fn clear(&mut self) {
         self.live.clear();
         self.streams.clear();
         self.rem.clear();
+        self.feed = false;
     }
 
     /// Advance every star and stream in the static background potential; each
@@ -1359,7 +1366,29 @@ impl Stars {
             // Advance streams and existing remnants before stars. Material or
             // remnants created by a star during this slice therefore start at
             // the slice boundary instead of being aged by time before birth.
-            self.streams.retain_mut(|stream| stream.advance(h, gm));
+            // A swallowed parcel plants a short flash just outside the photon
+            // sphere - the lensing smears it into an arc hugging the shadow.
+            let mut streams = std::mem::take(&mut self.streams);
+            streams.retain_mut(|stream| {
+                if stream.advance(h, gm) {
+                    return true;
+                }
+                if self.feed {
+                    let r = stream.p.len();
+                    let p = if r > 1e-9 {
+                        stream.p * (1.6 / r)
+                    } else {
+                        V3::new(1.6, 0.0, 0.0)
+                    };
+                    self.rem.push(Remnant {
+                        p,
+                        b: 750.0 * stream.w,
+                        sc: (600.0 * stream.w).cbrt(),
+                    });
+                }
+                false
+            });
+            self.streams = streams;
             let fade = (-h / (INFALL_FADE * 0.35)).exp();
             self.rem.retain_mut(|rem| {
                 rem.b *= fade;
@@ -1740,8 +1769,6 @@ struct ShCtx {
     c: f64,
     s: f64,
     ppc0: f64,
-    /// the parked-diorama mode keeps the background fixed as well
-    twinkle: bool,
 }
 
 /// Emission of one pixel at time `t` from cached geometry. This is all an
@@ -1764,11 +1791,10 @@ fn shade(g: &Geo, ctx: &ShCtx) -> [f64; 3] {
     }
     // tonemap(0) = 0, so pure-sky pixels skip the exponentials entirely
     let c = if g.n > 0 { tonemap(col) } else { [0.0; 3] };
-    let sky_t = if ctx.twinkle { ctx.t } else { 0.0 };
     let bg = match &g.sky {
         Some(cached) => {
             if ctx.orb == 0.0 {
-                sky_rgb(cached, sky_t)
+                sky_rgb(cached, ctx.t)
             } else {
                 // the star field does not rotate with the camera: look it up
                 // again at the rotated escape direction (cheap - the geodesics
@@ -1778,7 +1804,7 @@ fn shade(g: &Geo, ctx: &ShCtx) -> [f64; 3] {
                     g.esc.y,
                     g.esc.x * ctx.s + g.esc.z * ctx.c,
                 );
-                sky_rgb(&stars(d, ctx.ppc0), sky_t)
+                sky_rgb(&stars(d, ctx.ppc0), ctx.t)
             }
         }
         None => [0.0; 3],
@@ -2451,7 +2477,6 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
         c: orbit.cos(),
         s: orbit.sin(),
         ppc0,
-        twinkle: !o.super_star,
     };
     // pixels that cannot change (no disk, no star, still camera) keep their
     // previous value; on the first frame or after a re-trace everything is
@@ -3348,7 +3373,6 @@ mod tests {
             c: orb.cos(),
             s: orb.sin(),
             ppc0: 3.0,
-            twinkle: true,
         };
         let mut geo = Geo::empty();
         geo.sky = Some(stars(esc, ctx.ppc0));
@@ -3427,6 +3451,7 @@ mod tests {
         let flown: f64 = st.streams.iter().map(|s| s.w).sum();
         assert!(inf.m + flown <= 1.0 + 1e-9);
         assert!(1.0 - inf.m > flown, "some mass must already be swallowed");
+        assert!(!st.rem.is_empty(), "the hole should have drunk by now");
     }
 
     #[test]
@@ -3497,6 +3522,36 @@ mod tests {
         }
         assert!(t > 20.0, "fell in too fast: t={t}");
         assert!(t < SUPER_STREAM_LIFE, "parcel cooled mid-flight: t={t}");
+    }
+
+    #[test]
+    fn swallowed_parcels_flash_only_while_feeding() {
+        let mk = || Stream {
+            p: V3::new(2.0, 0.0, 0.0),
+            v: V3::new(0.0, 0.0, 0.4),
+            w: 0.01,
+            age: 0.0,
+            life: 100.0,
+            drag: INFALL_DRAG,
+            bri: STREAM_BRI,
+            sig: STREAM_SIG,
+            fun: false,
+        };
+        let mut plain = Stars::new();
+        plain.streams.push(mk());
+        plain.advance(5.0);
+        assert!(plain.rem.is_empty());
+
+        let mut fed = Stars::new();
+        fed.feed = true;
+        fed.streams.push(mk());
+        fed.advance(0.5);
+        assert_eq!(fed.rem.len(), 1);
+        let rem = &fed.rem[0];
+        let full_fade = 7.5 * (-0.5 / (INFALL_FADE * 0.35)).exp();
+        assert!(rem.b < 7.5 && rem.b > full_fade - 1e-9);
+        assert!((rem.sc - (600.0_f64 * 0.01).cbrt()).abs() < 1e-12);
+        assert!((rem.p.len() - 1.6).abs() < 1e-9);
     }
 
     #[test]
