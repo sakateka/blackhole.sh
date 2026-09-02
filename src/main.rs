@@ -955,10 +955,7 @@ struct Infall {
 
 impl Infall {
     /// Deterministic spawn from a seed, so `--star` always looks the same.
-    /// `gm` is the hole's current pull (it fattens as it eats): the spawn
-    /// speed must match it, or later stars spawn under-orbited and plunge
-    /// straight into the hole without ever putting on a stripping show.
-    fn spawn(seed: i64, sc: f64, gm: f64, d: V3, a: V3, b: V3, sf: Option<f64>) -> Infall {
+    fn spawn(seed: i64, sc: f64, d: V3, a: V3, b: V3, sf: Option<f64>) -> Infall {
         let rnd = |k: i64| hash3i(seed, k, 0x51A7);
         let (r0, f0, drag) = if sc > 1.5 {
             (BIG_R0, BIG_F0, BIG_DRAG)
@@ -972,9 +969,8 @@ impl Infall {
         // circular speed the star starts at - 1 = a circular orbit,
         // 0 = a dead drop, negative = the orbit run backwards
         let f = sf.unwrap_or_else(|| mix(f0.0, f0.1, rnd(4)));
-        // circular speed of the pseudo-potential at r, at the hole's
-        // current (possibly fattened) strength
-        let vc = (gm * r).sqrt() / (r - RS);
+        // circular speed in the static pseudo-potential
+        let vc = (INFALL_GM * r).sqrt() / (r - RS);
         let p = d * r;
         let v = a * (f * vc * inc.cos() * cw) + b * (f * vc * inc.sin());
         Infall {
@@ -1023,9 +1019,16 @@ impl Infall {
                 self.p = self.p + self.v * h;
                 if self.sc > 1.5 && r < rt {
                     // inside the tidal radius the hole strips mass away
-                    let dm = self.m * INFALL_STRIP * ((rt / r) * (rt / r) * (rt / r) - 1.0) * h;
-                    self.m = (self.m - dm).max(0.05);
-                    self.debt += dm;
+                    let requested =
+                        self.m * INFALL_STRIP * ((rt / r) * (rt / r) * (rt / r) - 1.0) * h;
+                    let next_mass = (self.m - requested).max(0.05);
+                    self.debt += self.m - next_mass;
+                    self.m = next_mass;
+                }
+                if self.sc > 1.5 {
+                    // Keep unmaterialized shed mass in `debt` while the visual
+                    // particle pool is full; never create or discard mass just
+                    // because STREAM_MAX was reached.
                     while self.debt > 0.02 && streams.len() < STREAM_MAX {
                         self.debt -= 0.02;
                         self.ns += 1;
@@ -1036,7 +1039,6 @@ impl Infall {
                             age: 0.0,
                         });
                     }
-                    self.debt = self.debt.min(0.02);
                 }
                 if (self.p - self.tr_at).len() > INFALL_TRAIL_STEP {
                     self.tr.push(Trail::shed(self.p, self.v));
@@ -1055,9 +1057,9 @@ impl Infall {
     }
 }
 
-/// One particle of the mass a massive star shed: it feels the same
-/// pseudo-Newtonian pull - now around the fattened hole - with the full
-/// drag, and glows until it too crosses the horizon or cools off.
+/// One particle of the mass a massive star shed: it feels the same static
+/// pseudo-Newtonian pull with the full drag, and glows until it crosses the
+/// horizon or cools off.
 struct Stream {
     p: V3,
     v: V3,
@@ -1068,12 +1070,10 @@ struct Stream {
 
 impl Stream {
     /// Returns None while the stream lives; Some(w) once it is gone,
-    /// carrying the mass it still had if the hole swallowed it (0.0 if
-    /// it merely cooled off).
-    fn advance(&mut self, mut dt: f64, gm: f64) -> Option<f64> {
+    fn advance(&mut self, mut dt: f64, gm: f64) -> bool {
         let remaining = STREAM_LIFE - self.age;
         if remaining <= 0.0 {
-            return Some(0.0);
+            return false;
         }
         let cooled = dt >= remaining;
         dt = dt.min(remaining);
@@ -1086,11 +1086,17 @@ impl Stream {
             self.p = self.p + self.v * h;
             dt -= h;
             if self.p.len() <= INFALL_SWALLOW {
-                return Some(self.w);
+                return false;
             }
         }
-        cooled.then_some(0.0)
+        !cooled
     }
+}
+
+struct Remnant {
+    p: V3,
+    b: f64,
+    sc: f64,
 }
 
 /// All the infall state the animation owns.
@@ -1098,13 +1104,10 @@ struct Stars {
     live: Vec<Infall>,
     /// the streams the massive stars are shedding
     streams: Vec<Stream>,
-    /// mass the hole has eaten off the streams: GM fattens (up to 3x) as
-    /// it swallows, and every live star and stream feels it
-    m_acc: f64,
     /// a swallowed star leaves a glow parked just outside the photon sphere
     /// (the lensing smears it into an arc hugging the shadow), with its
     /// remaining brightness and its (mass-shrunk) glow scale
-    rem: Option<(V3, f64, f64)>,
+    rem: Vec<Remnant>,
     seed: i64,
 }
 
@@ -1113,8 +1116,7 @@ impl Stars {
         Stars {
             live: Vec::new(),
             streams: Vec::new(),
-            m_acc: 0.0,
-            rem: None,
+            rem: Vec::new(),
             seed: 0,
         }
     }
@@ -1122,9 +1124,6 @@ impl Stars {
     fn spawn(&mut self, big: bool, o: &Opt) {
         if self.live.iter().filter(|inf| inf.alive).count() < INFALL_MAX {
             self.seed += 1;
-            // spawn at the hole's current pull so every star gets the
-            // same show, not just the first one before it fattens
-            let gm = INFALL_GM * (1.0 + self.m_acc);
             // freeze the screen basis at spawn time so the star dives in
             // from the side the user asked for; with no --origin every
             // star picks a side at random, except the first one, which
@@ -1146,7 +1145,6 @@ impl Stars {
             self.live.push(Infall::spawn(
                 self.seed,
                 if big { 3.0 } else { 1.0 },
-                gm,
                 d,
                 a,
                 b,
@@ -1158,37 +1156,25 @@ impl Stars {
     fn clear(&mut self) {
         self.live.clear();
         self.streams.clear();
-        self.m_acc = 0.0;
-        self.rem = None;
+        self.rem.clear();
     }
 
-    /// Advance every star and stream; each star that crosses the horizon
-    /// plants a remnant glow where it died, and each swallowed stream
-    /// leaves the hole that much heavier.
+    /// Advance every star and stream in the static background potential; each
+    /// star that crosses the horizon plants its own fading remnant glow.
     fn advance(&mut self, mut dt: f64) {
         while dt > 1e-9 {
             let h = dt.min(MATTER_STEP);
-            let gm = INFALL_GM * (1.0 + self.m_acc);
+            let gm = INFALL_GM;
 
             // Advance streams and existing remnants before stars. Material or
             // remnants created by a star during this slice therefore start at
             // the slice boundary instead of being aged by time before birth.
-            let mut i = 0;
-            while i < self.streams.len() {
-                match self.streams[i].advance(h, gm) {
-                    None => i += 1,
-                    Some(w) => {
-                        self.m_acc = (self.m_acc + w).min(2.0);
-                        self.streams.remove(i);
-                    }
-                }
-            }
-            if let Some((_, b, _)) = self.rem.as_mut() {
-                *b *= (-h / (INFALL_FADE * 0.35)).exp();
-            }
-            if self.rem.is_some_and(|(_, b, _)| b < 0.02) {
-                self.rem = None;
-            }
+            self.streams.retain_mut(|stream| stream.advance(h, gm));
+            let fade = (-h / (INFALL_FADE * 0.35)).exp();
+            self.rem.retain_mut(|rem| {
+                rem.b *= fade;
+                rem.b >= 0.02
+            });
 
             let mut i = 0;
             while i < self.live.len() {
@@ -1202,7 +1188,11 @@ impl Stars {
                     } else {
                         V3::new(1.6, 0.0, 0.0)
                     };
-                    self.rem = Some((p, 1.0, inf.sc * inf.m.cbrt()));
+                    self.rem.push(Remnant {
+                        p,
+                        b: 1.0,
+                        sc: inf.sc * inf.m.cbrt(),
+                    });
                 }
                 if keep {
                     i += 1;
@@ -1258,13 +1248,13 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
             sig: STREAM_SIG,
         });
     }
-    if let Some((p, b, scl)) = st.rem {
+    for rem in &st.rem {
         let col = heat(0.95);
-        let w = INFALL_REM_BRI * b * scl;
+        let w = INFALL_REM_BRI * rem.b * rem.sc;
         g.push(Glow {
-            p: rot(p),
+            p: rot(rem.p),
             c: [col[0] * w, col[1] * w, col[2] * w],
-            sig: INFALL_REM_SIG * scl,
+            sig: INFALL_REM_SIG * rem.sc,
         });
     }
     g
@@ -2729,7 +2719,6 @@ mod tests {
         stars.live.push(Infall::spawn(
             1,
             sc,
-            INFALL_GM,
             d,
             a,
             V3::new(0.0, 0.0, 1.0),
@@ -2798,20 +2787,62 @@ mod tests {
             20.0,
             1.0 / 120.0,
         );
-        let one_brightness = one_jump.rem.expect("one-jump remnant").1;
-        let frame_brightness = many_frames.rem.expect("frame-step remnant").1;
+        let one_brightness = one_jump.rem.first().expect("one-jump remnant").b;
+        let frame_brightness = many_frames.rem.first().expect("frame-step remnant").b;
 
         assert!(one_brightness > 0.8);
         assert!((one_brightness - frame_brightness).abs() < 0.05);
     }
 
     #[test]
-    fn large_time_jump_does_not_expire_new_streams() {
-        let one_jump = evolve(stripping_stars(), 8.0, 8.0);
-        let many_frames = evolve(stripping_stars(), 8.0, 1.0 / 120.0);
+    fn cooling_stream_integrates_until_its_lifetime() {
+        let mut stream = Stream {
+            p: V3::new(10.0, 0.0, 0.0),
+            v: V3::new(0.0, 1.0, 0.0),
+            w: 0.02,
+            age: STREAM_LIFE - 0.01,
+        };
+        let before = stream.p;
 
-        assert!(one_jump.m_acc > 0.0);
-        assert!((one_jump.m_acc - many_frames.m_acc).abs() < 0.03);
+        assert!(!stream.advance(0.02, INFALL_GM));
+        assert!((stream.age - STREAM_LIFE).abs() < 1e-12);
+        assert!((stream.p - before).len() > 0.0);
+    }
+
+    #[test]
+    fn stripping_conserves_unabsorbed_mass() {
+        let mut stars = stripping_stars();
+        let mut infall = stars.live.remove(0);
+        infall.p = V3::new(1.3, 0.0, 0.0);
+        let mut streams = Vec::new();
+
+        infall.advance(0.02, INFALL_GM, &mut streams);
+        let represented = infall.m + infall.debt + streams.iter().map(|s| s.w).sum::<f64>();
+
+        assert!((represented - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn simultaneous_infalls_keep_separate_remnants() {
+        let make = |p: V3| Infall {
+            p,
+            v: p.norm() * -1.0,
+            tr: vec![Trail::shed(p, p.norm() * -1.0)],
+            tr_at: p,
+            alive: true,
+            sc: 1.0,
+            m: 1.0,
+            drag: INFALL_DRAG,
+            ns: 0,
+            debt: 0.0,
+        };
+        let mut stars = Stars::new();
+        stars.live.push(make(V3::new(1.16, 0.0, 0.0)));
+        stars.live.push(make(V3::new(0.0, 1.16, 0.0)));
+
+        stars.advance(0.02);
+
+        assert_eq!(stars.rem.len(), 2);
     }
 
     #[test]
