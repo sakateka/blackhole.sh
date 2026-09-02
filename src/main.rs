@@ -496,6 +496,381 @@ fn stars_moved(d: V3, ppc0: f64, cached: &Sky) -> Sky {
 // re-evaluate only the emission. Video codecs call these I-frames and
 // P-frames; here a P-frame costs a fraction of the I-frame.
 
+// ------------------------------------------------------------- infall star
+// A star on its way through the disk and into the hole. The orbit is
+// Newtonian in a Paczynski-Wiita pseudo-potential (a = -GM p / ((r-RS)^2 r)),
+// which puts its innermost stable circle at 3 RS - the same radius the
+// disk's inner rim sits at - so the plunge happens where it should. A
+// whisper of drag eats angular momentum and turns the fly-by into an
+// inspiral. The picture is a string of glowing points (the head, a cooling
+// trail, and a remnant that lingers by the photon sphere): every traced ray
+// picks up emission where it passes close to one, exactly like the disk
+// crossings.
+
+/// gravitational parameter of the pseudo-potential; v_circ(12) ~ 3.5, so a
+/// whole orbit at the spawn radius takes a few tens of seconds on screen
+const INFALL_GM: f64 = 120.0;
+/// drag per unit time - the reason the orbit decays instead of holding
+const INFALL_DRAG: f64 = 0.0045;
+/// spawn radius range
+const INFALL_R0: (f64, f64) = (11.0, 15.0);
+/// spawn speed as a fraction of the local circular velocity (below 1: the
+/// star arrives already doomed)
+const INFALL_F0: (f64, f64) = (0.60, 0.85);
+/// spawn inclination range, radians off the disk plane
+const INFALL_INC: (f64, f64) = (0.15, 0.45);
+/// below this radius the star is gone
+const INFALL_SWALLOW: f64 = RS * 1.15;
+/// the remnant a swallowed star leaves fades over about this much time
+const INFALL_FADE: f64 = 2.6;
+/// the trail drops a point whenever the head has moved this far
+const INFALL_TRAIL_STEP: f64 = 1.1;
+/// trail length in points
+const INFALL_TRAIL_N: usize = 14;
+/// at most this many stars at once
+const INFALL_MAX: usize = 3;
+/// gaussian radii of head / trail point / remnant, in scene units
+const INFALL_SIG: f64 = 0.85;
+const INFALL_TRAIL_SIG: f64 = 0.38;
+const INFALL_REM_SIG: f64 = 0.5;
+/// emission weights of head / trail / remnant (soft-clipped when shaded)
+const INFALL_HEAD_BRI: f64 = 15.0;
+const INFALL_TRAIL_BRI: f64 = 3.2;
+const INFALL_REM_BRI: f64 = 10.0;
+
+/// One glowing point of the stream, in the trace (camera-azimuth-0) frame,
+/// its colour already weighted: head hot and bright, trail dim and red,
+/// remnant fading. `sig` is the gaussian radius in scene units.
+#[derive(Clone, Copy)]
+struct Glow {
+    p: V3,
+    c: [f64; 3],
+    sig: f64,
+}
+
+/// Every glow lives at radius <= INFALL_R0.1 and reaches at most 3.5 sigmas
+/// plus the shell's radial thickness past it, so a segment whose midpoint is
+/// inside this radius is worth recording for the deposition to chew on.
+const GLOW_R: f64 = INFALL_R0.1 + 3.5 * INFALL_SIG + 0.06 * INFALL_R0.1;
+
+/// One recorded trace segment inside the glow shell: the endpoints (start
+/// position and the step vector), the midpoint's radius for the cheap radial
+/// pre-reject, the integration step and the transmittance that was in effect
+/// when it was traced, and the pixel it belongs to. Storing these is what
+/// lets the glows move every frame without re-integrating the geodesics:
+/// the deposition just replays the gaussian sums over the bins it touches.
+#[derive(Clone, Copy)]
+struct Seg {
+    p0: [f32; 3],
+    sg: [f32; 3],
+    r: f32,
+    dt: f32,
+    tr: f32,
+    px: u32,
+}
+
+/// Uniform bins over the cube of side 33 * BIN_W centred on the hole - the
+/// whole region any glow can light up - so a glow only ever meets the
+/// segments physically near it instead of all of them.
+const BIN_N: usize = 33;
+const BIN_W: f64 = 1.2;
+
+/// The bin a segment's midpoint falls in, clamped to the cube's edge.
+fn bin_of(s: &Seg) -> usize {
+    let c = |a: f32, v: f32| {
+        let m = a as f64 + 0.5 * v as f64;
+        (((m / BIN_W).floor() as isize) + 16).clamp(0, BIN_N as isize - 1)
+    };
+    let x = c(s.p0[0], s.sg[0]);
+    let y = c(s.p0[1], s.sg[1]);
+    let z = c(s.p0[2], s.sg[2]);
+    (x + BIN_N as isize * (y + BIN_N as isize * z)) as usize
+}
+
+/// Sort the segments into their bins: count per bin, turn the counts into
+/// exclusive prefix offsets, then permute in place - each swap drops one
+/// segment into its bin's next free slot, so no second arena is needed.
+fn build_bins(segs: &mut [Seg], bin_off: &mut Vec<u32>) {
+    bin_off.clear();
+    bin_off.resize(BIN_N * BIN_N * BIN_N + 1, 0);
+    for s in segs.iter() {
+        bin_off[bin_of(s) + 1] += 1;
+    }
+    for i in 1..bin_off.len() {
+        bin_off[i] += bin_off[i - 1];
+    }
+    let mut cur = bin_off[..bin_off.len() - 1].to_vec();
+    let mut i = 0;
+    while i < segs.len() {
+        let b = bin_of(&segs[i]);
+        if (i as u32) >= bin_off[b] && (i as u32) < bin_off[b + 1] {
+            i += 1;
+        } else {
+            let t = cur[b] as usize;
+            segs.swap(i, t);
+            cur[b] += 1;
+        }
+    }
+}
+
+/// Add one glow's light to `out`, indexed by pixel. This is the same sum the
+/// trace used to carry inline - radial pre-reject, closest approach of the
+/// segment, gaussian weight times step times transmittance - but only over
+/// the bins within the glow's reach, a few thousand segments instead of
+/// every segment tested against every glow.
+fn deposit_one(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut dyn FnMut(usize, [f64; 3])) {
+    let gr = gl.p.len();
+    let rej = gl.sig * 3.5 + 0.06 * gr;
+    let range = (rej / BIN_W).ceil() as isize + 1;
+    let cell = |v: f64| (((v / BIN_W).floor() as isize) + 16).clamp(0, BIN_N as isize - 1);
+    let (gx, gy, gz) = (cell(gl.p.x), cell(gl.p.y), cell(gl.p.z));
+    let s2 = 2.0 * gl.sig * gl.sig;
+    let last = BIN_N as isize - 1;
+    for z in (gz - range).max(0)..=(gz + range).min(last) {
+        for y in (gy - range).max(0)..=(gy + range).min(last) {
+            for x in (gx - range).max(0)..=(gx + range).min(last) {
+                let b = (x + BIN_N as isize * (y + BIN_N as isize * z)) as usize;
+                for s in &segs[bin_off[b] as usize..bin_off[b + 1] as usize] {
+                    // cheap radial pre-reject: the glow lives in a shell
+                    // around the hole at its own radius
+                    if (s.r as f64 - gr).abs() > rej + 1e-4 {
+                        continue;
+                    }
+                    // closest approach of the segment to the glow
+                    let (px, py, pz) = (s.p0[0] as f64, s.p0[1] as f64, s.p0[2] as f64);
+                    let (sx, sy, sz) = (s.sg[0] as f64, s.sg[1] as f64, s.sg[2] as f64);
+                    let du = (gl.p.x - px) * sx + (gl.p.y - py) * sy + (gl.p.z - pz) * sz;
+                    let u = (du / (sx * sx + sy * sy + sz * sz)).clamp(0.0, 1.0);
+                    let dx = gl.p.x - (px + sx * u);
+                    let dy = gl.p.y - (py + sy * u);
+                    let dz = gl.p.z - (pz + sz * u);
+                    let e =
+                        (-(dx * dx + dy * dy + dz * dz) / s2).exp() * s.dt as f64 * s.tr as f64;
+                    out(s.px as usize, [gl.c[0] * e, gl.c[1] * e, gl.c[2] * e]);
+                }
+            }
+        }
+    }
+}
+
+/// Zero the deposited glow and lay the frame's glows over the cached
+/// geometry: parallel over the glows into per-thread buffers when asked,
+/// straight into the pixels otherwise.
+fn deposit_glows(
+    segs: &[Seg],
+    bin_off: &[u32],
+    glows: &[Glow],
+    geo: &mut [Geo],
+    par: bool,
+    nthreads: usize,
+) {
+    if glows.is_empty() || segs.is_empty() {
+        return;
+    }
+    for g in geo.iter_mut() {
+        g.st = [0.0; 3];
+    }
+    let nt = if par { nthreads.min(glows.len()) } else { 1 };
+    if nt <= 1 {
+        for gl in glows {
+            deposit_one(gl, segs, bin_off, &mut |px, add| {
+                let g = &mut geo[px];
+                g.st[0] += add[0];
+                g.st[1] += add[1];
+                g.st[2] += add[2];
+            });
+        }
+    } else {
+        let mut bufs: Vec<Vec<[f64; 3]>> =
+            (0..nt).map(|_| vec![[0.0f64; 3]; geo.len()]).collect();
+        std::thread::scope(|sc| {
+            for (chunk, buf) in glows.chunks(glows.len().div_ceil(nt)).zip(bufs.iter_mut()) {
+                sc.spawn(move || {
+                    for gl in chunk {
+                        deposit_one(gl, segs, bin_off, &mut |px, add| {
+                            buf[px][0] += add[0];
+                            buf[px][1] += add[1];
+                            buf[px][2] += add[2];
+                        });
+                    }
+                });
+            }
+        });
+        for buf in &bufs {
+            for (g, b) in geo.iter_mut().zip(buf.iter()) {
+                g.st[0] += b[0];
+                g.st[1] += b[1];
+                g.st[2] += b[2];
+            }
+        }
+    }
+}
+
+/// 0 for x <= 0, x/(1+x) above: lets the glow blaze without a hard clip.
+fn softclip(x: f64) -> f64 {
+    if x <= 0.0 {
+        0.0
+    } else {
+        x / (1.0 + x)
+    }
+}
+
+/// Tidal brightening: the stream shines harder the deeper it falls.
+fn tide(r: f64) -> f64 {
+    1.0 + 9.0 * (RS / r) * (RS / r)
+}
+
+/// A live star: position, velocity and the trail of where it has been.
+struct Infall {
+    p: V3,
+    v: V3,
+    tr: Vec<V3>,
+}
+
+impl Infall {
+    /// Deterministic spawn from a seed, so `--star` always looks the same.
+    fn spawn(seed: i64) -> Infall {
+        let rnd = |k: i64| hash3i(seed, k, 0x51A7);
+        let r = mix(INFALL_R0.0, INFALL_R0.1, rnd(1));
+        let phi = rnd(2) * std::f64::consts::TAU;
+        let inc = mix(INFALL_INC.0, INFALL_INC.1, rnd(3));
+        let f = mix(INFALL_F0.0, INFALL_F0.1, rnd(4));
+        // circular speed of the pseudo-potential at r
+        let vc = (INFALL_GM * r).sqrt() / (r - RS);
+        let p = V3::new(r * phi.cos(), 0.0, r * phi.sin());
+        let tang = V3::new(-phi.sin(), 0.0, phi.cos());
+        let v = tang * (f * vc * inc.cos()) + V3::new(0.0, 1.0, 0.0) * (f * vc * inc.sin());
+        Infall { p, v, tr: vec![p] }
+    }
+
+    fn acc(p: V3) -> V3 {
+        let r = p.len();
+        p * (-INFALL_GM / ((r - RS) * (r - RS) * r))
+    }
+
+    /// Symplectic Euler with the step shrunk near the hole, plus drag.
+    /// Returns false once the star is inside the swallow radius.
+    fn advance(&mut self, mut dt: f64) -> bool {
+        while dt > 1e-9 {
+            let r = self.p.len() as f64;
+            let h = (if r < 3.0_f64 { 0.004_f64 } else { 0.02_f64 }).min(dt);
+            self.v = self.v + Self::acc(self.p) * h;
+            self.v = self.v * (1.0 - INFALL_DRAG * h);
+            self.p = self.p + self.v * h;
+            dt -= h;
+            let last = *self.tr.last().unwrap();
+            if (self.p - last).len() > INFALL_TRAIL_STEP {
+                self.tr.push(self.p);
+                if self.tr.len() > INFALL_TRAIL_N {
+                    self.tr.remove(0);
+                }
+            }
+            if self.p.len() <= INFALL_SWALLOW {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// All the infall state the animation owns.
+struct Stars {
+    live: Vec<Infall>,
+    /// a swallowed star leaves a glow parked just outside the photon sphere
+    /// (the lensing smears it into an arc hugging the shadow), with its
+    /// remaining brightness
+    rem: Option<(V3, f64)>,
+    seed: i64,
+}
+
+impl Stars {
+    fn new() -> Stars {
+        Stars {
+            live: Vec::new(),
+            rem: None,
+            seed: 0,
+        }
+    }
+
+    fn spawn(&mut self) {
+        if self.live.len() < INFALL_MAX {
+            self.seed += 1;
+            self.live.push(Infall::spawn(self.seed));
+        }
+    }
+
+    fn clear(&mut self) {
+        self.live.clear();
+        self.rem = None;
+    }
+
+    /// Advance every star; each one that crosses the horizon plants a
+    /// remnant glow where it died.
+    fn advance(&mut self, dt: f64) {
+        let mut i = 0;
+        while i < self.live.len() {
+            if self.live[i].advance(dt) {
+                i += 1;
+            } else {
+                let inf = self.live.remove(i);
+                let r = inf.p.len();
+                let p = if r > 1e-9 {
+                    inf.p * (1.6 / r)
+                } else {
+                    V3::new(1.6, 0.0, 0.0)
+                };
+                self.rem = Some((p, 1.0));
+            }
+        }
+        if let Some((_, b)) = self.rem.as_mut() {
+            *b *= (-dt / (INFALL_FADE * 0.35)).exp();
+        }
+        if self.rem.is_some_and(|(_, b)| b < 0.02) {
+            self.rem = None;
+        }
+    }
+}
+
+/// The frame's glow list: heads, trails and any remnant, rotated from the
+/// world frame into the trace frame - the same rotation the shading undoes
+/// when it re-looks-up the sky for an orbiting camera.
+fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
+    let (c, s) = (orb.cos(), orb.sin());
+    let rot = |p: V3| V3::new(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
+    let mut g: Vec<Glow> = Vec::new();
+    for inf in &st.live {
+        let head = heat(0.85);
+        let w = INFALL_HEAD_BRI * tide(inf.p.len());
+        g.push(Glow {
+            p: rot(inf.p),
+            c: [head[0] * w, head[1] * w, head[2] * w],
+            sig: INFALL_SIG,
+        });
+        // the trail: older points are dimmer and cooler
+        let n = inf.tr.len().max(1);
+        for (i, q) in inf.tr.iter().enumerate() {
+            let u = i as f64 / n as f64; // 0 = oldest, 1 = newest
+            let col = heat(0.25 + 0.5 * u);
+            let w = mix(0.25, 1.0, u) * INFALL_TRAIL_BRI * tide(q.len());
+            g.push(Glow {
+                p: rot(*q),
+                c: [col[0] * w, col[1] * w, col[2] * w],
+                sig: INFALL_TRAIL_SIG,
+            });
+        }
+    }
+    if let Some((p, b)) = st.rem {
+        let col = heat(0.95);
+        let w = INFALL_REM_BRI * b;
+        g.push(Glow {
+            p: rot(p),
+            c: [col[0] * w, col[1] * w, col[2] * w],
+            sig: INFALL_REM_SIG,
+        });
+    }
+    g
+}
+
 /// One crossing of the equatorial plane inside the disk, reduced to what a
 /// frame actually needs: the position (for the noise phase), the radius, the
 /// pattern drift rate and the fully pre-weighted static emission.
@@ -521,6 +896,8 @@ struct Geo {
     esc: V3,
     n: u8,
     cr: [Cross; 3],
+    /// emission deposited by the infalling star's glow along this ray
+    st: [f64; 3],
 }
 
 impl Geo {
@@ -528,7 +905,9 @@ impl Geo {
     /// crossings and no star to twinkle (the band is static). Its value from
     /// the previous frame is still correct, so shading can skip it entirely.
     fn is_static(&self) -> bool {
-        self.n == 0 && !self.sky.is_some_and(|s| s.star != [0.0, 0.0, 0.0])
+        self.n == 0
+            && self.st == [0.0, 0.0, 0.0]
+            && !self.sky.is_some_and(|s| s.star != [0.0, 0.0, 0.0])
     }
 
     fn empty() -> Geo {
@@ -543,18 +922,27 @@ impl Geo {
                 rr: 0.0,
                 em: [0.0; 3],
             }; 3],
+            st: [0.0; 3],
         }
     }
 }
 
 /// Geometry cache, invalidated whenever anything that bends the rays changes
-/// (frame size, zoom, tilt, shift, camera orbit angle).
+/// (frame size, zoom, tilt, shift, camera orbit angle). The star no longer
+/// takes part: its light is deposited per frame from the segment record.
 struct GeoCache {
     key: (usize, usize, u64, u64, u64),
     geo: Vec<Geo>,
     /// one byte per pixel: true = can change between frames. Scanning this
     /// instead of the 90 MB of Geo structs is what makes the skip cheap.
     mask: Vec<bool>,
+    /// the glow-shell segments of the last trace, binned by position: the
+    /// per-frame glow deposition scans these instead of re-integrating
+    segs: Vec<Seg>,
+    bin_off: Vec<u32>,
+    /// whether the last frame had glows (the deposition must run once more
+    /// to clear them after the star is gone)
+    glow_was: bool,
 }
 
 impl GeoCache {
@@ -564,19 +952,33 @@ impl GeoCache {
             key: (0, 0, 1, 1, 1),
             geo: Vec::new(),
             mask: Vec::new(),
+            segs: Vec::new(),
+            bin_off: Vec::new(),
+            glow_was: false,
         }
     }
 }
 
 /// Integrate one ray backwards from the camera and record what the shading
 /// will need later. Time-independent by construction; `ppc0` is the ray-grid
-/// pitch in pixels per star cell, needed to size the star cores.
-fn trace_geo(cam: &Cam, dir: V3, ppc0: f64, om_max: f64, out: &mut Geo) {
+/// pitch in pixels per star cell, needed to size the star cores. Segments
+/// inside the glow shell are appended to `segs` for the per-frame glow
+/// deposition; `px` is the pixel the ray (and those segments) belong to.
+fn trace_geo(
+    cam: &Cam,
+    dir: V3,
+    ppc0: f64,
+    om_max: f64,
+    out: &mut Geo,
+    px: usize,
+    segs: &mut Vec<Seg>,
+) {
     let mut p = cam.p;
     let mut v = dir;
     let h2 = p.cross(v).len2();
     let mut a = accel(p, h2);
     let mut tr = 1.0f64; // remaining transmittance
+    let st = [0.0f64; 3]; // glow is deposited after the trace, not here
     let mut n = 0u8;
     let mut cr = [Cross {
         x: 0.0,
@@ -595,6 +997,7 @@ fn trace_geo(cam: &Cam, dir: V3, ppc0: f64, om_max: f64, out: &mut Geo) {
                 esc: V3::new(0.0, 0.0, 0.0),
                 n,
                 cr,
+                st,
             };
             return;
         }
@@ -604,6 +1007,7 @@ fn trace_geo(cam: &Cam, dir: V3, ppc0: f64, om_max: f64, out: &mut Geo) {
                 esc: v,
                 n,
                 cr,
+                st,
             };
             return;
         }
@@ -614,6 +1018,22 @@ fn trace_geo(cam: &Cam, dir: V3, ppc0: f64, om_max: f64, out: &mut Geo) {
         let pn = p + v * dt + a * (0.5 * dt * dt);
         let an = accel(pn, h2);
         let vn = v + (a + an) * (0.5 * dt);
+
+        // the infalling star's glows are deposited after the trace, from a
+        // compact record of every segment that threads the glow shell:
+        // endpoints, step and the transmittance in effect here
+        let seg = pn - p;
+        let rm = (p + seg * 0.5).len();
+        if rm < GLOW_R {
+            segs.push(Seg {
+                p0: [p.x as f32, p.y as f32, p.z as f32],
+                sg: [seg.x as f32, seg.y as f32, seg.z as f32],
+                r: rm as f32,
+                dt: dt as f32,
+                tr: tr as f32,
+                px: px as u32,
+            });
+        }
 
         // did we cross the equatorial plane?
         if p.y * pn.y < 0.0 {
@@ -661,6 +1081,7 @@ fn trace_geo(cam: &Cam, dir: V3, ppc0: f64, om_max: f64, out: &mut Geo) {
         esc: V3::new(0.0, 0.0, 0.0),
         n,
         cr,
+        st,
     };
 }
 
@@ -727,10 +1148,21 @@ fn shade(g: &Geo, ctx: &ShCtx) -> [f64; 3] {
         }
         None => [0.0; 3],
     };
+    // the infalling star's glow: soft-clipped so it can blaze near the hole
+    // without flattening anything else, with a slow shimmer on top
+    let mut gl = [0.0f64; 3];
+    if g.st != [0.0, 0.0, 0.0] {
+        let fl = 0.86 + 0.14 * tw_sin(8.0 * ctx.t);
+        gl = [
+            softclip(g.st[0] * fl),
+            softclip(g.st[1] * fl),
+            softclip(g.st[2] * fl),
+        ];
+    }
     [
-        (c[0] + bg[0]).clamp(0.0, 1.0),
-        (c[1] + bg[1]).clamp(0.0, 1.0),
-        (c[2] + bg[2]).clamp(0.0, 1.0),
+        (c[0] + bg[0] + gl[0]).clamp(0.0, 1.0),
+        (c[1] + bg[1] + gl[1]).clamp(0.0, 1.0),
+        (c[2] + bg[2] + gl[2]).clamp(0.0, 1.0),
     ]
 }
 
@@ -777,6 +1209,8 @@ struct Opt {
     /// upper bound on rays cast per frame
     rays: usize,
     one_shot: Option<f64>,
+    /// start with a star spiralling into the hole
+    star: bool,
     ramp: Vec<char>,
 }
 
@@ -805,12 +1239,14 @@ fn parse_opt() -> Opt {
         tph: 0,
         rays: RAY_BUDGET,
         one_shot: None,
+        star: false,
         ramp: " .·:;+=*xX#%@█".chars().collect(),
     };
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         match a {
+            "--star" => o.star = true,
             "-m" | "--mode" => {
                 i += 1;
                 match args.get(i).map(|v| v.as_str()) {
@@ -908,8 +1344,10 @@ OPTIONS
                         and coarser, higher = sharper and slower
       --frame <n>       render a single frame at time n/fps and exit
       --no-color        no ANSI colours (pure ASCII output, good for pipes)
+      --star            add a star that gets swallowed by the hole
 
 KEYS        q/Esc quit    +/- zoom    up/down tilt    left/right orbit rate    space pause
+            s spawn star    x clear stars
 ";
 
 // ---------------------------------------------------------------- terminal
@@ -1100,7 +1538,7 @@ const RAY_BUDGET: usize = 200_000;
 
 /// Renders into `f`, reusing its pixel buffer between frames - a sixel frame
 /// is a 14 MB allocation and re-allocating it every frame shows.
-fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache) {
+fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[Glow]) {
     let s = (o.rays as f64 / (o.tpw as f64 * o.tph as f64))
         .min(1.0)
         .sqrt();
@@ -1143,7 +1581,10 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache) {
 
     // I-frame: full geodesic pass, only when the camera setup changes. The
     // orbit is deliberately absent from the key: rotation of the view is
-    // handled in the shading, not by moving the camera.
+    // handled in the shading, not by moving the camera. The stars are absent
+    // for the same reason - their light is re-deposited every frame onto the
+    // cached path segments by the glow pass below, so a moving star never
+    // costs a re-trace.
     let key = (w, h, zoom.to_bits(), o.tilt.to_bits(), shift.to_bits());
     let mut invalidated = false;
     if cache.key != key || cache.geo.len() != w * h {
@@ -1159,11 +1600,18 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache) {
         }
         let geo = &mut cache.geo;
         let mask = &mut cache.mask;
+        let mut segs: Vec<Seg> = Vec::new();
         if par {
+            // each band collects the glow-lit path segments into its own
+            // arena; concatenated in band order they arrive sorted by pixel,
+            // which keeps the deposition pass cache-friendly
+            let nband = h.div_ceil(rows_per);
+            let mut local: Vec<Vec<Seg>> = (0..nband).map(|_| Vec::new()).collect();
             thread::scope(|sc| {
-                for (n, (band, mband)) in geo
+                for (n, ((band, mband), slot)) in geo
                     .chunks_mut(rows_per * w)
                     .zip(mask.chunks_mut(rows_per * w))
+                    .zip(local.iter_mut())
                     .enumerate()
                 {
                     let cam = &cam;
@@ -1176,7 +1624,7 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache) {
                             for (x, (g, m)) in rowgeo.iter_mut().zip(rowmask.iter_mut()).enumerate()
                             {
                                 let dir = cam.ray(x, y, w, h, zoom, shift);
-                                trace_geo(cam, dir, ppc0, om_max, g);
+                                trace_geo(cam, dir, ppc0, om_max, g, y * w + x, slot);
                                 // remember which pixels can ever change - the
                                 // P-frames scan this byte mask instead of
                                 // streaming the whole geometry cache
@@ -1186,16 +1634,43 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache) {
                     });
                 }
             });
+            for v in local {
+                segs.extend_from_slice(&v);
+            }
         } else {
             for y in 0..h {
                 for x in 0..w {
                     let i = y * w + x;
                     let dir = cam.ray(x, y, w, h, zoom, shift);
-                    trace_geo(&cam, dir, ppc0, om_max, &mut geo[i]);
+                    trace_geo(&cam, dir, ppc0, om_max, &mut geo[i], i, &mut segs);
                     mask[i] = !geo[i].is_static();
                 }
             }
         }
+        // index the segment arena by position (in-place counting sort into
+        // 1.2-unit cells): the per-frame glow pass then touches only the few
+        // cells a glow can light instead of streaming the whole arena
+        build_bins(&mut segs, &mut cache.bin_off);
+        cache.segs = segs;
+    }
+
+    // Glow pass: the per-frame price of moving stars. The trace above pays
+    // no attention to the glows - it only cached the path segments a glow
+    // could ever light, binned by position. Every frame with live glows (and
+    // once more after the last of them dies, to wipe the residual light)
+    // re-deposits their light onto those segments: a small binned
+    // neighbourhood scan per glow, instead of the full re-trace a moving
+    // star used to force on every frame.
+    let glow_now = !glows.is_empty();
+    if glow_now || cache.glow_was {
+        deposit_glows(
+            &cache.segs,
+            &cache.bin_off,
+            glows,
+            &mut cache.geo,
+            par,
+            nthreads,
+        );
     }
 
     // P-frame: re-shade the cached geometry for the current time and azimuth.
@@ -1218,7 +1693,13 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache) {
     // previous value; on the first frame or after a re-trace everything is
     // shaded so the buffer is fully written. The mask carries the decision
     // so this pass streams 320 KB, not the whole geometry cache.
-    let skip_static = !invalidated && !resized && orbit == 0.0;
+    let skip_static =
+        !invalidated && !resized && orbit == 0.0 && !(glow_now || cache.glow_was);
+    // glow-lit pixels are not in the trace-time mask, so while any glow is
+    // live (and for one frame after the last one dies) everything is
+    // re-shaded; once the residual is cleared the cheap masked path is
+    // valid again
+    cache.glow_was = glow_now;
     let geo = &cache.geo;
     if par {
         thread::scope(|sc| {
@@ -1645,7 +2126,13 @@ fn main() {
             px: Vec::new(),
         };
         let mut cache = GeoCache::new();
-        render_frame(&o, t, &mut f, &mut cache);
+        let mut stars = Stars::new();
+        if o.star {
+            stars.spawn();
+            stars.advance(t);
+        }
+        let glows = glow_list(&stars, o.azi);
+        render_frame(&o, t, &mut f, &mut cache, &glows);
         let mut scr = Screen::new();
         draw_into(&o, &f, &mut out, &mut scr);
         println!("{out}");
@@ -1667,6 +2154,10 @@ fn main() {
         px: Vec::new(),
     };
     let mut cache = GeoCache::new();
+    let mut stars = Stars::new();
+    if o.star {
+        stars.spawn();
+    }
     let mut last = Instant::now();
     loop {
         let step = last.elapsed().as_secs_f64();
@@ -1674,9 +2165,11 @@ fn main() {
         if !paused {
             t += step * o.speed;
             o.azi += o.orbit.to_radians() * step * o.speed;
+            stars.advance(step * o.speed);
         }
         if !paused || !drawn {
-            render_frame(&o, t, &mut f, &mut cache);
+            let glows = glow_list(&stars, o.azi);
+            render_frame(&o, t, &mut f, &mut cache, &glows);
             out.clear();
             out.push_str("\x1b[H");
             draw_into(&o, &f, &mut out, &mut scr);
@@ -1721,6 +2214,15 @@ fn main() {
                 }
                 Key::Left => {
                     o.orbit = (o.orbit - ORBIT_STEP).max(-ORBIT_MAX);
+                }
+                // drop another star into the well / clear the ones in flight
+                Key::Char('s') => {
+                    stars.spawn();
+                    drawn = false;
+                }
+                Key::Char('x') => {
+                    stars.clear();
+                    drawn = false;
                 }
                 _ => {}
             }
