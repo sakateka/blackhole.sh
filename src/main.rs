@@ -703,6 +703,10 @@ struct Glow {
     p: V3,
     c: [f64; 3],
     sig: f64,
+    /// Funnel groups are broad, low-contrast render primitives. They use a
+    /// midpoint quadrature fast path; stellar heads/trails retain the exact
+    /// finite-segment integral below.
+    fast: bool,
 }
 
 /// Every glow lives at radius <= BIG_R0.1 and reaches at most 3.5 sigmas
@@ -800,6 +804,24 @@ fn segment_glow_weight(gl: &Glow, s: &Seg, erf_t: &[f32]) -> f64 {
     (-perp2 * inv * inv * 0.5).exp() * gl.sig * axial * s.tr as f64
 }
 
+/// Fast quadrature for the broad, low-contrast funnel groups. Their Gaussian
+/// radius is comparable to a traced segment, so sampling the segment midpoint
+/// is sufficient at terminal precision and avoids the two axial LUT lookups.
+#[inline(always)]
+fn segment_glow_midpoint(gl: &Glow, s: &Seg) -> f64 {
+    let px = s.p0[0] as f64 + 0.5 * s.sg[0] as f64;
+    let py = s.p0[1] as f64 + 0.5 * s.sg[1] as f64;
+    let pz = s.p0[2] as f64 + 0.5 * s.sg[2] as f64;
+    let dx = gl.p.x - px;
+    let dy = gl.p.y - py;
+    let dz = gl.p.z - pz;
+    let dl = (s.sg[0] as f64 * s.sg[0] as f64
+        + s.sg[1] as f64 * s.sg[1] as f64
+        + s.sg[2] as f64 * s.sg[2] as f64)
+        .sqrt();
+    (-0.5 * (dx * dx + dy * dy + dz * dz) / (gl.sig * gl.sig)).exp() * dl * s.tr as f64
+}
+
 /// Uniform bins over the cube of side BIN_N * BIN_W centred on the hole -
 /// the whole region any glow can light up, out past where the massive
 /// star spawns - so a glow only ever meets the segments physically near
@@ -852,7 +874,10 @@ fn build_bins(segs: &mut [Seg], bin_off: &mut Vec<u32>) {
 /// integral with transmittance - but only over
 /// the bins within the glow's reach, a few thousand segments instead of
 /// every segment tested against every glow.
-fn deposit_one(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut dyn FnMut(usize, [f64; 3])) {
+fn deposit_one_impl<F, const FAST: bool>(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut F)
+where
+    F: FnMut(usize, [f64; 3]),
+{
     let erf_t = ERF_LUT.get_or_init(build_erf_lut);
     let gr = gl.p.len();
     let rej = gl.sig * 3.5 + 0.06 * gr;
@@ -955,11 +980,30 @@ fn deposit_one(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut dyn FnMut(usi
                     if dx * dx + dy * dy + dz * dz > reach2 {
                         continue;
                     }
-                    let e = segment_glow_weight(gl, s, erf_t);
+                    let e = if FAST {
+                        segment_glow_midpoint(gl, s)
+                    } else {
+                        segment_glow_weight(gl, s, erf_t)
+                    };
                     out(s.px as usize, [gl.c[0] * e, gl.c[1] * e, gl.c[2] * e]);
                 }
             }
         }
+    }
+}
+
+/// Dispatch once per glow, so the hot segment loop is monomorphized: funnel
+/// groups contain no branch or axial-integral work, while stellar glows keep
+/// the exact path.
+#[inline]
+fn deposit_one<F>(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut F)
+where
+    F: FnMut(usize, [f64; 3]),
+{
+    if gl.fast {
+        deposit_one_impl::<F, true>(gl, segs, bin_off, out);
+    } else {
+        deposit_one_impl::<F, false>(gl, segs, bin_off, out);
     }
 }
 
@@ -1625,6 +1669,7 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
                 p: rot(inf.p),
                 c: [head[0] * w, head[1] * w, head[2] * w],
                 sig: INFALL_SIG * sig_scl,
+                fast: false,
             });
             if inf.sc > 5.5 {
                 // Stretch the donor's near-side envelope itself toward the
@@ -1642,6 +1687,7 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
                         p: rot(p),
                         c: [head[0] * lobe_w, head[1] * lobe_w, head[2] * lobe_w],
                         sig: mix(SUPER_SIG_ROOT, SUPER_SIG_TIP, u) * mass_scale,
+                        fast: false,
                     });
                 }
             }
@@ -1656,6 +1702,7 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
                 p: rot(q.p),
                 c: [col[0] * w, col[1] * w, col[2] * w],
                 sig: INFALL_TRAIL_SIG * sig_scl,
+                fast: false,
             });
         }
     }
@@ -1675,6 +1722,7 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
                 p: rot(first.p),
                 c: [w, 0.75 * w, 0.45 * w],
                 sig: first.sig,
+                fast: false,
             });
             si += 1;
             continue;
@@ -1724,6 +1772,7 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
                 p: rot(position),
                 c: [weight, 0.75 * weight, 0.45 * weight],
                 sig,
+                fast: true,
             });
         }
         si = end;
@@ -1735,6 +1784,7 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
             p: rot(rem.p),
             c: [col[0] * w, col[1] * w, col[2] * w],
             sig: INFALL_REM_SIG * rem.sc,
+            fast: false,
         });
     }
     g
@@ -3600,6 +3650,7 @@ mod tests {
                 p: gp,
                 c: [1.0; 3],
                 sig,
+                fast: false,
             };
             let n = 200_000;
             let mut numerical = 0.0;
@@ -3685,6 +3736,7 @@ mod tests {
                 p: v3(&mut rng) * 0.8,
                 c: [1.0; 3],
                 sig: 0.38 + 0.5 * next(&mut rng),
+                fast: false,
             })
             .collect();
         let mut acc = vec![0.0f64; 4096];
