@@ -537,6 +537,19 @@ const INFALL_REM_SIG: f64 = 0.5;
 const INFALL_HEAD_BRI: f64 = 15.0;
 const INFALL_TRAIL_BRI: f64 = 3.2;
 const INFALL_REM_BRI: f64 = 10.0;
+/// the massive star (3x the hole): spawns far out on a near-circular
+/// orbit and barely feels the drag, so the infall takes its time
+const BIG_R0: (f64, f64) = (24.0, 33.0);
+const BIG_F0: (f64, f64) = (0.58, 0.70);
+const BIG_DRAG: f64 = INFALL_DRAG * 0.25;
+/// how fast the massive star is torn apart inside its tidal radius
+const INFALL_STRIP: f64 = 2.5;
+/// how long a shed stream particle keeps glowing
+const STREAM_LIFE: f64 = 6.0;
+/// stream particles alive at once, tops
+const STREAM_MAX: usize = 24;
+const STREAM_BRI: f64 = 6.0;
+const STREAM_SIG: f64 = 0.45;
 
 /// One glowing point of the stream, in the trace (camera-azimuth-0) frame,
 /// its colour already weighted: head hot and bright, trail dim and red,
@@ -548,10 +561,11 @@ struct Glow {
     sig: f64,
 }
 
-/// Every glow lives at radius <= INFALL_R0.1 and reaches at most 3.5 sigmas
-/// plus the shell's radial thickness past it, so a segment whose midpoint is
-/// inside this radius is worth recording for the deposition to chew on.
-const GLOW_R: f64 = INFALL_R0.1 + 3.5 * INFALL_SIG + 0.06 * INFALL_R0.1;
+/// Every glow lives at radius <= BIG_R0.1 and reaches at most 3.5 sigmas
+/// times the largest star scale (3x for the massive star) plus the shell's
+/// radial thickness past it, so a segment whose midpoint is inside this
+/// radius is worth recording for the deposition to chew on.
+const GLOW_R: f64 = BIG_R0.1 + 3.5 * INFALL_SIG * 3.0 + 0.06 * BIG_R0.1;
 
 /// One recorded trace segment inside the glow shell: the endpoints (start
 /// position and the step vector), the midpoint's radius for the cheap radial
@@ -569,17 +583,20 @@ struct Seg {
     px: u32,
 }
 
-/// Uniform bins over the cube of side 33 * BIN_W centred on the hole - the
-/// whole region any glow can light up - so a glow only ever meets the
-/// segments physically near it instead of all of them.
-const BIN_N: usize = 33;
+/// Uniform bins over the cube of side BIN_N * BIN_W centred on the hole -
+/// the whole region any glow can light up, out past where the massive
+/// star spawns - so a glow only ever meets the segments physically near
+/// it instead of all of them.
+const BIN_N: usize = 75;
 const BIN_W: f64 = 1.2;
+/// the cube's centre: the bin index of the coordinate origin
+const BIN_C: isize = (BIN_N as isize) / 2;
 
 /// The bin a segment's midpoint falls in, clamped to the cube's edge.
 fn bin_of(s: &Seg) -> usize {
     let c = |a: f32, v: f32| {
         let m = a as f64 + 0.5 * v as f64;
-        (((m / BIN_W).floor() as isize) + 16).clamp(0, BIN_N as isize - 1)
+        (((m / BIN_W).floor() as isize) + BIN_C).clamp(0, BIN_N as isize - 1)
     };
     let x = c(s.p0[0], s.sg[0]);
     let y = c(s.p0[1], s.sg[1]);
@@ -622,7 +639,7 @@ fn deposit_one(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut dyn FnMut(usi
     let gr = gl.p.len();
     let rej = gl.sig * 3.5 + 0.06 * gr;
     let range = (rej / BIN_W).ceil() as isize + 1;
-    let cell = |v: f64| (((v / BIN_W).floor() as isize) + 16).clamp(0, BIN_N as isize - 1);
+    let cell = |v: f64| (((v / BIN_W).floor() as isize) + BIN_C).clamp(0, BIN_N as isize - 1);
     let (gx, gy, gz) = (cell(gl.p.x), cell(gl.p.y), cell(gl.p.z));
     let s2 = 2.0 * gl.sig * gl.sig;
     let last = BIN_N as isize - 1;
@@ -720,44 +737,95 @@ fn tide(r: f64) -> f64 {
     1.0 + 9.0 * (RS / r) * (RS / r)
 }
 
-/// A live star: position, velocity and the trail of where it has been.
+/// A live star: position, velocity, the trail of where it has been and -
+/// for the massive one - how much mass it has left plus the bookkeeping
+/// for the streams it sheds on the way down.
 struct Infall {
     p: V3,
     v: V3,
     tr: Vec<V3>,
+    /// size scale: 3.0 for the massive star, else 1.0
+    sc: f64,
+    /// remaining mass fraction: the massive star is stripped inside its
+    /// tidal radius and the glow tracks sc * m^(1/3)
+    m: f64,
+    /// drag this star feels (a quarter of the usual for the massive one)
+    drag: f64,
+    /// streams shed so far, and the mass shed since the last one
+    ns: u64,
+    debt: f64,
 }
 
 impl Infall {
     /// Deterministic spawn from a seed, so `--star` always looks the same.
-    fn spawn(seed: i64) -> Infall {
+    /// `gm` is the hole's current pull (it fattens as it eats): the spawn
+    /// speed must match it, or later stars spawn under-orbited and plunge
+    /// straight into the hole without ever putting on a stripping show.
+    fn spawn(seed: i64, sc: f64, gm: f64) -> Infall {
         let rnd = |k: i64| hash3i(seed, k, 0x51A7);
-        let r = mix(INFALL_R0.0, INFALL_R0.1, rnd(1));
+        let (r0, f0, drag) = if sc > 1.5 {
+            (BIG_R0, BIG_F0, BIG_DRAG)
+        } else {
+            (INFALL_R0, INFALL_F0, INFALL_DRAG)
+        };
+        let r = mix(r0.0, r0.1, rnd(1));
         let phi = rnd(2) * std::f64::consts::TAU;
         let inc = mix(INFALL_INC.0, INFALL_INC.1, rnd(3));
-        let f = mix(INFALL_F0.0, INFALL_F0.1, rnd(4));
-        // circular speed of the pseudo-potential at r
-        let vc = (INFALL_GM * r).sqrt() / (r - RS);
+        let f = mix(f0.0, f0.1, rnd(4));
+        // circular speed of the pseudo-potential at r, at the hole's
+        // current (possibly fattened) strength
+        let vc = (gm * r).sqrt() / (r - RS);
         let p = V3::new(r * phi.cos(), 0.0, r * phi.sin());
         let tang = V3::new(-phi.sin(), 0.0, phi.cos());
         let v = tang * (f * vc * inc.cos()) + V3::new(0.0, 1.0, 0.0) * (f * vc * inc.sin());
-        Infall { p, v, tr: vec![p] }
+        Infall {
+            p,
+            v,
+            tr: vec![p],
+            sc,
+            m: 1.0,
+            drag,
+            ns: 0,
+            debt: 0.0,
+        }
     }
 
-    fn acc(p: V3) -> V3 {
+    fn acc(p: V3, gm: f64) -> V3 {
         let r = p.len();
-        p * (-INFALL_GM / ((r - RS) * (r - RS) * r))
+        p * (-gm / ((r - RS) * (r - RS) * r))
     }
 
-    /// Symplectic Euler with the step shrunk near the hole, plus drag.
-    /// Returns false once the star is inside the swallow radius.
-    fn advance(&mut self, mut dt: f64) -> bool {
+    /// Symplectic Euler with the step shrunk near the hole, plus this
+    /// star's drag - a quarter of the usual for the massive one. Inside
+    /// its tidal radius the massive star is torn apart: every 0.02 of
+    /// shed mass becomes a glowing stream particle. Returns false once
+    /// the star is inside the swallow radius.
+    fn advance(&mut self, mut dt: f64, gm: f64, streams: &mut Vec<Stream>) -> bool {
+        let rt = 0.9 * self.sc * (2.0f64 / 3.0).cbrt();
         while dt > 1e-9 {
             let r = self.p.len() as f64;
             let h = (if r < 3.0_f64 { 0.004_f64 } else { 0.02_f64 }).min(dt);
-            self.v = self.v + Self::acc(self.p) * h;
-            self.v = self.v * (1.0 - INFALL_DRAG * h);
+            self.v = self.v + Self::acc(self.p, gm) * h;
+            self.v = self.v * (1.0 - self.drag * h);
             self.p = self.p + self.v * h;
             dt -= h;
+            if self.sc > 1.5 && r < rt {
+                // inside the tidal radius the hole strips mass away
+                let dm = self.m * INFALL_STRIP * ((rt / r) * (rt / r) * (rt / r) - 1.0) * h;
+                self.m = (self.m - dm).max(0.05);
+                self.debt += dm;
+                while self.debt > 0.02 && streams.len() < STREAM_MAX {
+                    self.debt -= 0.02;
+                    self.ns += 1;
+                    streams.push(Stream {
+                        p: self.p,
+                        v: self.v * (0.95 + 0.10 * (self.ns % 4) as f64),
+                        w: 0.02,
+                        age: 0.0,
+                    });
+                }
+                self.debt = self.debt.min(0.02);
+            }
             let last = *self.tr.last().unwrap();
             if (self.p - last).len() > INFALL_TRAIL_STEP {
                 self.tr.push(self.p);
@@ -773,13 +841,53 @@ impl Infall {
     }
 }
 
+/// One particle of the mass a massive star shed: it feels the same
+/// pseudo-Newtonian pull - now around the fattened hole - with the full
+/// drag, and glows until it too crosses the horizon or cools off.
+struct Stream {
+    p: V3,
+    v: V3,
+    /// how much star mass it carries, i.e. how brightly it glows
+    w: f64,
+    age: f64,
+}
+
+impl Stream {
+    /// Returns None while the stream lives; Some(w) once it is gone,
+    /// carrying the mass it still had if the hole swallowed it (0.0 if
+    /// it merely cooled off).
+    fn advance(&mut self, mut dt: f64, gm: f64) -> Option<f64> {
+        self.age += dt;
+        if self.age > STREAM_LIFE {
+            return Some(0.0);
+        }
+        while dt > 1e-9 {
+            let r = self.p.len() as f64;
+            let h = (if r < 3.0_f64 { 0.004_f64 } else { 0.02_f64 }).min(dt);
+            self.v = self.v + Infall::acc(self.p, gm) * h;
+            self.v = self.v * (1.0 - INFALL_DRAG * h);
+            self.p = self.p + self.v * h;
+            dt -= h;
+            if self.p.len() <= INFALL_SWALLOW {
+                return Some(self.w);
+            }
+        }
+        None
+    }
+}
+
 /// All the infall state the animation owns.
 struct Stars {
     live: Vec<Infall>,
+    /// the streams the massive stars are shedding
+    streams: Vec<Stream>,
+    /// mass the hole has eaten off the streams: GM fattens (up to 3x) as
+    /// it swallows, and every live star and stream feels it
+    m_acc: f64,
     /// a swallowed star leaves a glow parked just outside the photon sphere
     /// (the lensing smears it into an arc hugging the shadow), with its
-    /// remaining brightness
-    rem: Option<(V3, f64)>,
+    /// remaining brightness and its (mass-shrunk) glow scale
+    rem: Option<(V3, f64, f64)>,
     seed: i64,
 }
 
@@ -787,29 +895,39 @@ impl Stars {
     fn new() -> Stars {
         Stars {
             live: Vec::new(),
+            streams: Vec::new(),
+            m_acc: 0.0,
             rem: None,
             seed: 0,
         }
     }
 
-    fn spawn(&mut self) {
+    fn spawn(&mut self, big: bool) {
         if self.live.len() < INFALL_MAX {
             self.seed += 1;
-            self.live.push(Infall::spawn(self.seed));
+            // spawn at the hole's current pull so every star gets the
+            // same show, not just the first one before it fattens
+            let gm = INFALL_GM * (1.0 + self.m_acc);
+            self.live
+                .push(Infall::spawn(self.seed, if big { 3.0 } else { 1.0 }, gm));
         }
     }
 
     fn clear(&mut self) {
         self.live.clear();
+        self.streams.clear();
+        self.m_acc = 0.0;
         self.rem = None;
     }
 
-    /// Advance every star; each one that crosses the horizon plants a
-    /// remnant glow where it died.
+    /// Advance every star and stream; each star that crosses the horizon
+    /// plants a remnant glow where it died, and each swallowed stream
+    /// leaves the hole that much heavier.
     fn advance(&mut self, dt: f64) {
+        let gm = INFALL_GM * (1.0 + self.m_acc);
         let mut i = 0;
         while i < self.live.len() {
-            if self.live[i].advance(dt) {
+            if self.live[i].advance(dt, gm, &mut self.streams) {
                 i += 1;
             } else {
                 let inf = self.live.remove(i);
@@ -819,13 +937,23 @@ impl Stars {
                 } else {
                     V3::new(1.6, 0.0, 0.0)
                 };
-                self.rem = Some((p, 1.0));
+                self.rem = Some((p, 1.0, inf.sc * inf.m.cbrt()));
             }
         }
-        if let Some((_, b)) = self.rem.as_mut() {
+        let mut i = 0;
+        while i < self.streams.len() {
+            match self.streams[i].advance(dt, gm) {
+                None => i += 1,
+                Some(w) => {
+                    self.m_acc = (self.m_acc + w).min(2.0);
+                    self.streams.remove(i);
+                }
+            }
+        }
+        if let Some((_, b, _)) = self.rem.as_mut() {
             *b *= (-dt / (INFALL_FADE * 0.35)).exp();
         }
-        if self.rem.is_some_and(|(_, b)| b < 0.02) {
+        if self.rem.is_some_and(|(_, b, _)| b < 0.02) {
             self.rem = None;
         }
     }
@@ -839,33 +967,46 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
     let rot = |p: V3| V3::new(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
     let mut g: Vec<Glow> = Vec::new();
     for inf in &st.live {
+        // the glow tracks the star's size and whatever mass it has left
+        let scl = inf.sc * inf.m.cbrt();
         let head = heat(0.85);
-        let w = INFALL_HEAD_BRI * tide(inf.p.len());
+        let w = INFALL_HEAD_BRI * tide(inf.p.len()) * scl;
         g.push(Glow {
             p: rot(inf.p),
             c: [head[0] * w, head[1] * w, head[2] * w],
-            sig: INFALL_SIG,
+            sig: INFALL_SIG * scl,
         });
         // the trail: older points are dimmer and cooler
         let n = inf.tr.len().max(1);
         for (i, q) in inf.tr.iter().enumerate() {
             let u = i as f64 / n as f64; // 0 = oldest, 1 = newest
             let col = heat(0.25 + 0.5 * u);
-            let w = mix(0.25, 1.0, u) * INFALL_TRAIL_BRI * tide(q.len());
+            let w = mix(0.25, 1.0, u) * INFALL_TRAIL_BRI * tide(q.len()) * scl;
             g.push(Glow {
                 p: rot(*q),
                 c: [col[0] * w, col[1] * w, col[2] * w],
-                sig: INFALL_TRAIL_SIG,
+                sig: INFALL_TRAIL_SIG * scl,
             });
         }
     }
-    if let Some((p, b)) = st.rem {
+    // the mass the massive star sheds: a cooler string of glows, each
+    // fading with age
+    for stm in &st.streams {
+        let b = 1.0 - stm.age / STREAM_LIFE;
+        let w = STREAM_BRI * stm.w * b * tide(stm.p.len());
+        g.push(Glow {
+            p: rot(stm.p),
+            c: [w, 0.75 * w, 0.45 * w],
+            sig: STREAM_SIG,
+        });
+    }
+    if let Some((p, b, scl)) = st.rem {
         let col = heat(0.95);
-        let w = INFALL_REM_BRI * b;
+        let w = INFALL_REM_BRI * b * scl;
         g.push(Glow {
             p: rot(p),
             c: [col[0] * w, col[1] * w, col[2] * w],
-            sig: INFALL_REM_SIG,
+            sig: INFALL_REM_SIG * scl,
         });
     }
     g
@@ -1211,6 +1352,8 @@ struct Opt {
     one_shot: Option<f64>,
     /// start with a star spiralling into the hole
     star: bool,
+    /// start with a massive star, 3x the size of the hole
+    big_star: bool,
     ramp: Vec<char>,
 }
 
@@ -1240,6 +1383,7 @@ fn parse_opt() -> Opt {
         rays: RAY_BUDGET,
         one_shot: None,
         star: false,
+        big_star: false,
         ramp: " .·:;+=*xX#%@█".chars().collect(),
     };
     let mut i = 0;
@@ -1247,6 +1391,7 @@ fn parse_opt() -> Opt {
         let a = args[i].as_str();
         match a {
             "--star" => o.star = true,
+            "--big-star" | "--big-start" => o.big_star = true,
             "-m" | "--mode" => {
                 i += 1;
                 match args.get(i).map(|v| v.as_str()) {
@@ -1345,9 +1490,10 @@ OPTIONS
       --frame <n>       render a single frame at time n/fps and exit
       --no-color        no ANSI colours (pure ASCII output, good for pipes)
       --star            add a star that gets swallowed by the hole
+      --big-star        start with a massive star, 3x the size of the hole
 
 KEYS        q/Esc quit    +/- zoom    up/down tilt    left/right orbit rate    space pause
-            s spawn star    x clear stars
+            s spawn star    S spawn big star    x clear stars
 ";
 
 // ---------------------------------------------------------------- terminal
@@ -2127,8 +2273,8 @@ fn main() {
         };
         let mut cache = GeoCache::new();
         let mut stars = Stars::new();
-        if o.star {
-            stars.spawn();
+        if o.big_star || o.star {
+            stars.spawn(o.big_star);
             stars.advance(t);
         }
         let glows = glow_list(&stars, o.azi);
@@ -2155,8 +2301,8 @@ fn main() {
     };
     let mut cache = GeoCache::new();
     let mut stars = Stars::new();
-    if o.star {
-        stars.spawn();
+    if o.big_star || o.star {
+        stars.spawn(o.big_star);
     }
     let mut last = Instant::now();
     loop {
@@ -2217,7 +2363,11 @@ fn main() {
                 }
                 // drop another star into the well / clear the ones in flight
                 Key::Char('s') => {
-                    stars.spawn();
+                    stars.spawn(false);
+                    drawn = false;
+                }
+                Key::Char('S') => {
+                    stars.spawn(true);
                     drawn = false;
                 }
                 Key::Char('x') => {
