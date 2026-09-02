@@ -610,6 +610,34 @@ const INFALL_REM_BRI: f64 = 10.0;
 const BIG_R0: (f64, f64) = (24.0, 33.0);
 const BIG_F0: (f64, f64) = (0.58, 0.70);
 const BIG_DRAG: f64 = INFALL_DRAG * 0.25;
+/// the superstar: a puffy giant several times the massive star's size, on
+/// a wide near-circular orbit that barely decays. Its tenuous envelope
+/// bleeds through the inner Lagrange point the whole time - one glowing
+/// parcel at a time, each on its own long arc into the hole - so the
+/// transfer plays out over tens of minutes instead of one quick shred.
+const SUPER_SC: f64 = 6.0;
+const SUPER_R0: (f64, f64) = (24.0, 30.0);
+const SUPER_F0: (f64, f64) = (0.90, 0.97);
+const SUPER_DRAG: f64 = INFALL_DRAG * 0.08;
+/// envelope mass bled into the transfer stream per second: at this rate
+/// the star still keeps most of itself after ten minutes of watching
+const SUPER_SHED_RATE: f64 = 0.00045;
+/// mass (and glow weight) of one shed parcel, and how many may be in
+/// flight at once - the chain of parcels strung along the arc is the
+/// visible bridge between the two
+const SUPER_SHED_W: f64 = 0.00315;
+const SUPER_STREAM_MAX: usize = 160;
+/// the bleed is diffuse shock-heated gas rather than a compact clump: it
+/// couples to the field only weakly (a shade of the star's own drag, so
+/// each parcel spirals in over minutes, not seconds) and shines far
+/// brighter per unit mass, which is the only way a deliberately slow
+/// drain stays visible at all
+const SUPER_STREAM_DRAG: f64 = INFALL_DRAG * 0.25;
+const SUPER_STREAM_BRI: f64 = 90.0;
+const SUPER_STREAM_LIFE: f64 = 900.0;
+/// and it is a fat diffuse thing, not a compact clump - a thicker gaussian
+/// so the chain of parcels reads as a filament rather than a dotted line
+const SUPER_STREAM_SIG: f64 = 0.62;
 /// how fast the massive star is torn apart inside its tidal radius
 const INFALL_STRIP: f64 = 2.5;
 /// how long a shed stream particle keeps glowing
@@ -631,9 +659,10 @@ struct Glow {
 }
 
 /// Every glow lives at radius <= BIG_R0.1 and reaches at most 3.5 sigmas
-/// times the largest star scale (3x for the massive star) plus the shell's
-/// radial thickness past it, so a segment whose midpoint is inside this
-/// radius is worth recording for the deposition to chew on.
+/// times the largest star scale (3x for the massive star; the superstar's
+/// glow radius is capped at the same size, see `glow_list`) plus the
+/// shell's radial thickness past it, so a segment whose midpoint is
+/// inside this radius is worth recording for the deposition to chew on.
 const GLOW_R: f64 = BIG_R0.1 + 3.5 * INFALL_SIG * 3.0 + 0.06 * BIG_R0.1;
 
 /// One recorded trace segment inside the glow shell: the endpoints (start
@@ -1021,7 +1050,9 @@ impl Infall {
     /// Deterministic spawn from a seed, so `--star` always looks the same.
     fn spawn(seed: i64, sc: f64, d: V3, a: V3, b: V3, sf: Option<f64>) -> Infall {
         let rnd = |k: i64| hash3i(seed, k, 0x51A7);
-        let (r0, f0, drag) = if sc > 1.5 {
+        let (r0, f0, drag) = if sc > 5.5 {
+            (SUPER_R0, SUPER_F0, SUPER_DRAG)
+        } else if sc > 1.5 {
             (BIG_R0, BIG_F0, BIG_DRAG)
         } else {
             (INFALL_R0, INFALL_F0, INFALL_DRAG)
@@ -1089,18 +1120,58 @@ impl Infall {
                     self.debt += self.m - next_mass;
                     self.m = next_mass;
                 }
+                if self.sc > 5.5 {
+                    // Roche-lobe overflow: far outside the tidal radius the
+                    // tenuous envelope already bleeds through the inner
+                    // Lagrange point - slowly, so the transfer lasts
+                    let bleed = SUPER_SHED_RATE * h;
+                    let next_mass = (self.m - bleed).max(0.05);
+                    self.debt += self.m - next_mass;
+                    self.m = next_mass;
+                }
                 if self.sc > 1.5 {
+                    let (w0, cap, l1) = if self.sc > 5.5 {
+                        (SUPER_SHED_W, SUPER_STREAM_MAX, true)
+                    } else {
+                        (0.02, STREAM_MAX, false)
+                    };
                     // Keep unmaterialized shed mass in `debt` while the visual
                     // particle pool is full; never create or discard mass just
-                    // because STREAM_MAX was reached.
-                    while self.debt > 0.02 && streams.len() < STREAM_MAX {
-                        self.debt -= 0.02;
+                    // because the pool was reached.
+                    while self.debt > w0 && streams.len() < cap {
+                        self.debt -= w0;
                         self.ns += 1;
+                        // the overflow leaves through L1: a touch slower than
+                        // the star itself and nudged toward the hole, so each
+                        // parcel finds its own decaying arc
+                        let v = if l1 {
+                            let rad = self.p.norm();
+                            self.v * (0.80 + 0.06 * (self.ns % 5) as f64)
+                                + rad * (-0.10 * self.v.len())
+                        } else {
+                            self.v * (0.95 + 0.10 * (self.ns % 4) as f64)
+                        };
                         streams.push(Stream {
-                            p: self.p,
-                            v: self.v * (0.95 + 0.10 * (self.ns % 4) as f64),
-                            w: 0.02,
+                            p: if l1 {
+                                self.p * (1.0 - 0.02)
+                            } else {
+                                self.p
+                            },
+                            v,
+                            w: w0,
                             age: 0.0,
+                            life: if l1 {
+                                SUPER_STREAM_LIFE
+                            } else {
+                                STREAM_LIFE
+                            },
+                            drag: if l1 {
+                                SUPER_STREAM_DRAG
+                            } else {
+                                INFALL_DRAG
+                            },
+                            bri: if l1 { SUPER_STREAM_BRI } else { STREAM_BRI },
+                            sig: if l1 { SUPER_STREAM_SIG } else { STREAM_SIG },
                         });
                     }
                 }
@@ -1122,20 +1193,27 @@ impl Infall {
 }
 
 /// One particle of the mass a massive star shed: it feels the same static
-/// pseudo-Newtonian pull with the full drag, and glows until it crosses the
-/// horizon or cools off.
+/// pseudo-Newtonian pull (with its own drag: the superstar's diffuse bleed
+/// couples to the field harder than a compact clump) and glows until it
+/// crosses the horizon or cools off.
 struct Stream {
     p: V3,
     v: V3,
-    /// how much star mass it carries, i.e. how brightly it glows
+    /// how much star mass it carries; `bri` is how brightly that mass
+    /// shines - far above STREAM_BRI for the shock-heated superstar bleed -
+    /// and `sig` how wide the glow spreads
     w: f64,
     age: f64,
+    life: f64,
+    drag: f64,
+    bri: f64,
+    sig: f64,
 }
 
 impl Stream {
     /// Returns None while the stream lives; Some(w) once it is gone,
     fn advance(&mut self, mut dt: f64, gm: f64) -> bool {
-        let remaining = STREAM_LIFE - self.age;
+        let remaining = self.life - self.age;
         if remaining <= 0.0 {
             return false;
         }
@@ -1146,7 +1224,7 @@ impl Stream {
             let r = self.p.len();
             let h = (if r < 3.0_f64 { 0.004_f64 } else { 0.02_f64 }).min(dt);
             self.v = self.v + Infall::acc(self.p, gm) * h;
-            self.v = self.v * (1.0 - INFALL_DRAG * h);
+            self.v = self.v * (1.0 - self.drag * h);
             self.p = self.p + self.v * h;
             dt -= h;
             if self.p.len() <= INFALL_SWALLOW {
@@ -1173,6 +1251,10 @@ struct Stars {
     /// remaining brightness and its (mass-shrunk) glow scale
     rem: Vec<Remnant>,
     seed: i64,
+    /// superstar mode: a swallowed stream parcel plants one small flash of
+    /// the same kind, so the accretion end of the bridge flickers as the
+    /// hole drinks
+    feed: bool,
 }
 
 impl Stars {
@@ -1182,30 +1264,35 @@ impl Stars {
             streams: Vec::new(),
             rem: Vec::new(),
             seed: 0,
+            feed: false,
         }
+    }
+
+    /// Pick the screen side the next star dives in from and freeze the
+    /// screen basis at spawn time, so the star enters from the side the
+    /// user asked for; with no --origin every star picks a side at random,
+    /// except the first one, which enters from the left.
+    fn origin_basis(&mut self, o: &Opt) -> (V3, V3, V3) {
+        self.seed += 1;
+        let cam = Cam::new(o.azi, o.tilt.to_radians());
+        let origin = o.origin.unwrap_or(if self.seed == 1 {
+            Origin::Left
+        } else {
+            match (hash3i(self.seed, 0xC0DE, 0x51A7) * 6.0) as usize {
+                0 => Origin::Left,
+                1 => Origin::Right,
+                2 => Origin::Top,
+                3 => Origin::Bottom,
+                4 => Origin::Front,
+                _ => Origin::Back,
+            }
+        });
+        origin.basis(&cam)
     }
 
     fn spawn(&mut self, big: bool, o: &Opt) {
         if self.live.iter().filter(|inf| inf.alive).count() < INFALL_MAX {
-            self.seed += 1;
-            // freeze the screen basis at spawn time so the star dives in
-            // from the side the user asked for; with no --origin every
-            // star picks a side at random, except the first one, which
-            // enters from the left
-            let cam = Cam::new(o.azi, o.tilt.to_radians());
-            let origin = o.origin.unwrap_or(if self.seed == 1 {
-                Origin::Left
-            } else {
-                match (hash3i(self.seed, 0xC0DE, 0x51A7) * 6.0) as usize {
-                    0 => Origin::Left,
-                    1 => Origin::Right,
-                    2 => Origin::Top,
-                    3 => Origin::Bottom,
-                    4 => Origin::Front,
-                    _ => Origin::Back,
-                }
-            });
-            let (d, a, b) = origin.basis(&cam);
+            let (d, a, b) = self.origin_basis(o);
             self.live.push(Infall::spawn(
                 self.seed,
                 if big { 3.0 } else { 1.0 },
@@ -1217,10 +1304,24 @@ impl Stars {
         }
     }
 
+    /// The superstar is meant to be the whole show, so only one of it at
+    /// a time; unlike the others it drains into the hole over tens of
+    /// minutes instead of ending in one shred.
+    fn spawn_super(&mut self, o: &Opt) {
+        if self.live.iter().any(|inf| inf.sc > 5.5) {
+            return;
+        }
+        let (d, a, b) = self.origin_basis(o);
+        self.live
+            .push(Infall::spawn(self.seed, SUPER_SC, d, a, b, o.star_speed));
+        self.feed = true;
+    }
+
     fn clear(&mut self) {
         self.live.clear();
         self.streams.clear();
         self.rem.clear();
+        self.feed = false;
     }
 
     /// Advance every star and stream in the static background potential; each
@@ -1233,7 +1334,31 @@ impl Stars {
             // Advance streams and existing remnants before stars. Material or
             // remnants created by a star during this slice therefore start at
             // the slice boundary instead of being aged by time before birth.
-            self.streams.retain_mut(|stream| stream.advance(h, gm));
+            // A swallowed parcel plants a short flash just outside the photon
+            // sphere (in superstar mode, where the accretion end of the bridge
+            // is half the show) - the lensing smears it into an arc hugging
+            // the shadow, the same trick swallowed stars use.
+            let mut streams = std::mem::take(&mut self.streams);
+            streams.retain_mut(|stream| {
+                if stream.advance(h, gm) {
+                    return true;
+                }
+                if self.feed {
+                    let r = stream.p.len();
+                    let p = if r > 1e-9 {
+                        stream.p * (1.6 / r)
+                    } else {
+                        V3::new(1.6, 0.0, 0.0)
+                    };
+                    self.rem.push(Remnant {
+                        p,
+                        b: 40.0 * stream.w,
+                        sc: (60.0 * stream.w).cbrt(),
+                    });
+                }
+                false
+            });
+            self.streams = streams;
             let fade = (-h / (INFALL_FADE * 0.35)).exp();
             self.rem.retain_mut(|rem| {
                 rem.b *= fade;
@@ -1277,15 +1402,22 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
     let rot = |p: V3| V3::new(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
     let mut g: Vec<Glow> = Vec::new();
     for inf in &st.live {
-        // the glow tracks the star's size and whatever mass it has left
+        // the glow tracks the star's size and whatever mass it has left;
+        // brightness follows the mass up to half again past the massive
+        // star's, and the radius is capped at the massive star's - a bigger
+        // or brighter blob would wash the frame whenever it sweeps near the
+        // camera, and a bigger radius would reach past the shell of recorded
+        // segments (GLOW_R) that the binned deposition scans
         let scl = inf.sc * inf.m.cbrt();
+        let vis = scl.min(4.5);
+        let sig_scl = scl.min(3.0);
         if inf.alive {
             let head = heat(0.85);
-            let w = INFALL_HEAD_BRI * tide(inf.p.len()) * scl;
+            let w = INFALL_HEAD_BRI * tide(inf.p.len()) * vis;
             g.push(Glow {
                 p: rot(inf.p),
                 c: [head[0] * w, head[1] * w, head[2] * w],
-                sig: INFALL_SIG * scl,
+                sig: INFALL_SIG * sig_scl,
             });
         }
         // the trail: older parcels are dimmer and cooler
@@ -1293,23 +1425,23 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
         for (i, q) in inf.tr.iter().enumerate() {
             let u = i as f64 / n as f64; // 0 = oldest, 1 = newest
             let col = heat(0.25 + 0.5 * u);
-            let w = mix(0.25, 1.0, u) * INFALL_TRAIL_BRI * tide(q.p.len()) * scl;
+            let w = mix(0.25, 1.0, u) * INFALL_TRAIL_BRI * tide(q.p.len()) * vis;
             g.push(Glow {
                 p: rot(q.p),
                 c: [col[0] * w, col[1] * w, col[2] * w],
-                sig: INFALL_TRAIL_SIG * scl,
+                sig: INFALL_TRAIL_SIG * sig_scl,
             });
         }
     }
     // the mass the massive star sheds: a cooler string of glows, each
     // fading with age
     for stm in &st.streams {
-        let b = 1.0 - stm.age / STREAM_LIFE;
-        let w = STREAM_BRI * stm.w * b * tide(stm.p.len());
+        let b = 1.0 - stm.age / stm.life;
+        let w = stm.bri * stm.w * b * tide(stm.p.len());
         g.push(Glow {
             p: rot(stm.p),
             c: [w, 0.75 * w, 0.45 * w],
-            sig: STREAM_SIG,
+            sig: stm.sig,
         });
     }
     for rem in &st.rem {
@@ -1711,6 +1843,8 @@ struct Opt {
     star: bool,
     /// start with a massive star, 3x the size of the hole
     big_star: bool,
+    /// start with a superstar bleeding onto the hole over a very long time
+    super_star: bool,
     /// which side of the screen the infalling star dives in from; None =
     /// a random side per star (the first star enters from the left)
     origin: Option<Origin>,
@@ -1747,6 +1881,7 @@ fn parse_opt() -> Opt {
         one_shot: None,
         star: false,
         big_star: false,
+        super_star: false,
         origin: None,
         star_speed: None,
         ramp: " .·:;+=*xX#%@█".chars().collect(),
@@ -1757,6 +1892,7 @@ fn parse_opt() -> Opt {
         match a {
             "--star" => o.star = true,
             "--big-star" | "--big-start" => o.big_star = true,
+            "--super-star" | "--superstar" => o.super_star = true,
             "-m" | "--mode" => {
                 i += 1;
                 match args.get(i).map(|v| v.as_str()) {
@@ -1877,6 +2013,9 @@ OPTIONS
       --no-color        no ANSI colours (pure ASCII output, good for pipes)
       --star            add a star that gets swallowed by the hole
       --big-star        start with a massive star, 3x the size of the hole
+      --super-star     start with a superstar: a giant on a wide orbit bleeding a
+                        luminous stream into the hole, parcel by parcel, for a
+                        very long time (s/S still add normal stars on top)
       --origin <side>   side the star dives in from: left|right|top|bottom|front|back
                         (default: random per star; the first star dives in from the left)
       --star-speed <n>  initial star speed as a fraction of the local circular
@@ -2667,7 +2806,10 @@ fn main() {
         };
         let mut cache = GeoCache::new();
         let mut stars = Stars::new();
-        if o.big_star || o.star {
+        if o.super_star {
+            stars.spawn_super(&o);
+            stars.advance(t);
+        } else if o.big_star || o.star {
             stars.spawn(o.big_star, &o);
             stars.advance(t);
         }
@@ -2696,7 +2838,9 @@ fn main() {
     };
     let mut cache = GeoCache::new();
     let mut stars = Stars::new();
-    if o.big_star || o.star {
+    if o.super_star {
+        stars.spawn_super(&o);
+    } else if o.big_star || o.star {
         stars.spawn(o.big_star, &o);
     }
     let mut last = Instant::now();
@@ -3020,6 +3164,10 @@ mod tests {
             v: V3::new(0.0, 1.0, 0.0),
             w: 0.02,
             age: STREAM_LIFE - 0.01,
+            life: STREAM_LIFE,
+            drag: INFALL_DRAG,
+            bri: STREAM_BRI,
+            sig: STREAM_SIG,
         };
         let before = stream.p;
 
@@ -3157,6 +3305,123 @@ mod tests {
         assert!(right.dot(cam.r) > 0.0);
         assert!(front.dot(toward_camera) > 0.0);
         assert!(back.dot(toward_camera) < 0.0);
+    }
+
+    fn test_opt() -> Opt {
+        Opt {
+            mode: Mode::Ascii,
+            fps: 30.0,
+            zoom: 1.0,
+            speed: 1.0,
+            orbit: 0.0,
+            azi: 0.0,
+            tilt: CAM_TILT,
+            shift: 0.0,
+            color: true,
+            cols: 80,
+            rows: 24,
+            tpw: 160,
+            tph: 96,
+            rays: RAY_BUDGET,
+            one_shot: None,
+            star: false,
+            big_star: false,
+            super_star: false,
+            origin: None,
+            star_speed: None,
+            ramp: Vec::new(),
+        }
+    }
+
+
+
+    #[test]
+    fn super_star_bleeds_slowly_and_keeps_its_distance() {
+        let o = test_opt();
+        let mut stars = Stars::new();
+        stars.spawn_super(&o);
+        assert!(stars.feed);
+        assert_eq!(stars.live.len(), 1);
+        let r0 = stars.live[0].p.len();
+        assert!((SUPER_R0.0..=SUPER_R0.1).contains(&r0), "r0={r0}");
+        // a second superstar never joins the first
+        stars.spawn_super(&o);
+        assert_eq!(stars.live.len(), 1);
+
+        // ten simulated minutes: the drain is deliberately glacial
+        let st = evolve(stars, 600.0, 0.1);
+        let inf = &st.live[0];
+        assert!(inf.alive, "the star should outlast the drain");
+        assert!(inf.m > 0.6, "drained too fast: m={}", inf.m);
+        assert!(inf.p.len() > 8.0, "fell in too fast: r={}", inf.p.len());
+        // the shed mass went into the bridge (or already down the hole),
+        // never into the void
+        let flown: f64 = st.streams.iter().map(|s| s.w).sum();
+        assert!(st.streams.len() > 10, "bridge too sparse");
+        assert!(inf.m + flown <= 1.0 + 1e-9);
+        assert!(inf.m + flown < inf.m + 1.0); // trivially true; ledger below
+        assert!(1.0 - inf.m > flown, "some mass must already be swallowed");
+    }
+
+    #[test]
+    fn super_parcels_take_the_long_way_round() {
+        // one parcel launched the way the superstar sheds it: it must spiral
+        // for minutes (the whole point of the mode) yet still arrive within
+        // its own lifetime, so no shed mass is silently lost to cooling
+        let r = 23.0;
+        let vc = (INFALL_GM * r).sqrt() / (r - RS);
+        let mut s = Stream {
+            p: V3::new(r, 0.0, 0.0),
+            v: V3::new(0.0, 0.0, 1.0) * (vc * 0.86) + V3::new(-1.0, 0.0, 0.0) * (0.1 * vc),
+            w: SUPER_SHED_W,
+            age: 0.0,
+            life: SUPER_STREAM_LIFE,
+            drag: SUPER_STREAM_DRAG,
+            bri: SUPER_STREAM_BRI,
+            sig: SUPER_STREAM_SIG,
+        };
+        let mut t = 0.0;
+        while t < SUPER_STREAM_LIFE {
+            if !s.advance(0.25, INFALL_GM) {
+                break;
+            }
+            t += 0.25;
+        }
+        assert!(t > 150.0, "fell in too fast: t={t}");
+        assert!(t < SUPER_STREAM_LIFE, "parcel cooled mid-flight: t={t}");
+    }
+
+    #[test]
+    fn swallowed_parcels_flash_only_while_feeding() {
+        let mk = || Stream {
+            p: V3::new(2.0, 0.0, 0.0),
+            v: V3::new(0.0, 0.0, 0.4),
+            w: 0.01,
+            age: 0.0,
+            life: 100.0,
+            drag: INFALL_DRAG,
+            bri: STREAM_BRI,
+            sig: STREAM_SIG,
+        };
+        // without the superstar there is no flicker
+        let mut plain = Stars::new();
+        plain.streams.push(mk());
+        plain.advance(5.0);
+        assert!(plain.rem.is_empty());
+        // with it, the swallowed parcel parks its flash by the photon sphere
+        let mut fed = Stars::new();
+        fed.feed = true;
+        fed.streams.push(mk());
+        fed.advance(0.5);
+        assert_eq!(fed.rem.len(), 1);
+        let rem = &fed.rem[0];
+        // planted at 40*w (0.4) at the moment of swallowing and fading
+        // exponentially since - so strictly between the just-planted value
+        // and a full 0.5 s of fade
+        let full_fade = 0.4 * (-0.5 / (INFALL_FADE * 0.35)).exp();
+        assert!(rem.b < 0.4 && rem.b > full_fade - 1e-9);
+        assert!((rem.sc - (60.0_f64 * 0.01).cbrt()).abs() < 1e-12);
+        assert!((rem.p.len() - 1.6).abs() < 1e-9);
     }
 
 }
