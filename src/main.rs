@@ -1334,9 +1334,10 @@ fn trace_geo(
             return;
         }
         if r > ESCAPE && p.dot(v) > 0.0 {
+            let esc = v.norm();
             *out = Geo {
-                sky: Some(stars(v, ppc0)),
-                esc: v,
+                sky: Some(stars(esc, ppc0)),
+                esc,
                 n,
                 cr,
                 st,
@@ -2680,6 +2681,25 @@ mod tests {
         assert!((beta2 - 0.24390243902439027).abs() < 1e-14);
         assert!((beta - beta2.sqrt()).abs() < 1e-14);
         assert!((beta - 0.49386479832479485).abs() < 1e-14);
+    }
+
+    #[test]
+    fn escaped_ray_is_stored_as_a_direction() {
+        let cam = Cam::new(0.0, 12.0_f64.to_radians());
+        let mut geo = Geo::empty();
+        let mut segs = Vec::new();
+        trace_geo(
+            &cam,
+            cam.ray(0, 0, 8, 8, 1.0, 0.0),
+            3.0,
+            10.0,
+            &mut geo,
+            0,
+            &mut segs,
+        );
+
+        assert!(geo.sky.is_some());
+        assert!((geo.esc.len() - 1.0).abs() < 1e-14);
     }
 
     #[test]
