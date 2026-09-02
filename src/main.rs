@@ -762,6 +762,10 @@ struct Opt {
     zoom: f64,
     speed: f64,
     orbit: f64,
+    /// Current camera azimuth in radians. Accumulated by the animation loop
+    /// (not recomputed as orbit*t) so that changing the orbit rate mid-flight
+    /// never jumps the view.
+    azi: f64,
     tilt: f64,
     shift: f64,
     color: bool,
@@ -791,6 +795,7 @@ fn parse_opt() -> Opt {
         zoom: 1.0,
         speed: 1.0,
         orbit: 0.0,
+        azi: 0.0,
         tilt: CAM_TILT,
         shift: 0.0,
         color: true,
@@ -904,7 +909,7 @@ OPTIONS
       --frame <n>       render a single frame at time n/fps and exit
       --no-color        no ANSI colours (pure ASCII output, good for pipes)
 
-KEYS        q/Esc quit    +/- zoom    up/down tilt    space pause
+KEYS        q/Esc quit    +/- zoom    up/down tilt    left/right orbit rate    space pause
 ";
 
 // ---------------------------------------------------------------- terminal
@@ -1032,6 +1037,11 @@ const TILT_STEP: f64 = 1.0;
 /// (forward becomes parallel to the world-up axis).
 const TILT_LIMIT: f64 = 80.0;
 
+/// Orbit rate step per arrow press, in degrees per second (held keys
+/// auto-repeat, so this is also how fast the rate itself slews).
+const ORBIT_STEP: f64 = 1.0;
+const ORBIT_MAX: f64 = 90.0;
+
 /// Poll stdin for one key. Arrow keys arrive as 3-byte bursts (`ESC [ A`, or
 /// `ESC O A` in application cursor mode); a lone ESC is either the Esc key
 /// or a burst that came in fragmented, so give the terminal a few
@@ -1107,7 +1117,7 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache) {
         f.px.resize(w * h, [0.0; 3]);
     }
     let px = &mut f.px;
-    let orbit = o.orbit.to_radians() * t; // camera azimuth right now
+    let orbit = o.azi; // camera azimuth right now (kept by the caller)
                                           // The camera may orbit, but the hole is axially symmetric: geometry is
                                           // traced once at azimuth zero and shaded at the current azimuth (see
                                           // `shade`), so an orbiting camera never pays for a re-trace.
@@ -1628,6 +1638,7 @@ fn main() {
 
     if let Some(n) = o.one_shot {
         let t = n / o.fps * o.speed;
+        o.azi = o.orbit.to_radians() * t;
         let mut f = Frame {
             w: 0,
             h: 0,
@@ -1662,6 +1673,7 @@ fn main() {
         last = Instant::now();
         if !paused {
             t += step * o.speed;
+            o.azi += o.orbit.to_radians() * step * o.speed;
         }
         if !paused || !drawn {
             render_frame(&o, t, &mut f, &mut cache);
@@ -1700,7 +1712,16 @@ fn main() {
                     o.tilt = (o.tilt - TILT_STEP).max(-TILT_LIMIT);
                     drawn = false;
                 }
-                // Left/Right are parsed but not bound to anything yet
+                // orbit rate: faster / slower (through zero into reverse).
+                // The azimuth itself is accumulated state, so the view never
+                // jumps when the rate changes. The rate is not part of the
+                // geometry cache key (axial symmetry), so this costs nothing.
+                Key::Right => {
+                    o.orbit = (o.orbit + ORBIT_STEP).min(ORBIT_MAX);
+                }
+                Key::Left => {
+                    o.orbit = (o.orbit - ORBIT_STEP).max(-ORBIT_MAX);
+                }
                 _ => {}
             }
         }
