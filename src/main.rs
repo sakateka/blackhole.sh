@@ -329,6 +329,12 @@ fn tw_sin(x: f64) -> f64 {
 
 // ------------------------------------------------------------ the disk
 //
+#[inline]
+fn local_orbit_beta(rr: f64) -> (f64, f64) {
+    let beta2 = (0.5 * RS) / (rr - RS);
+    (beta2.sqrt().min(0.85), beta2)
+}
+
 /// Time-independent part of the disk emission at one crossing: colour times
 /// intensity with the turbulence streak factored out, because the streak is
 /// the only thing that still moves once the geodesics are traced. Returns the
@@ -343,8 +349,7 @@ fn disk_em(rr: f64, hp: V3, vd: V3) -> ([f64; 3], f64) {
 
     // local Keplerian speed seen by a static observer: v^2 = M/(r-2M), M=RS/2
     let rs_r = RS / rr;
-    let beta2 = (0.5 * RS) / (rr - RS);
-    let beta = beta2.min(0.85);
+    let (beta, beta2) = local_orbit_beta(rr);
     let gamma = 1.0 / (1.0 - beta2).max(1e-3).sqrt();
 
     // prograde orbital direction
@@ -2666,6 +2671,15 @@ mod tests {
 
         assert!(trail.advance(2.0, INFALL_GM));
         assert!(trail.p.len() < p.len());
+    }
+
+    #[test]
+    fn disk_uses_local_orbital_speed_not_its_square() {
+        let (beta, beta2) = local_orbit_beta(3.05);
+
+        assert!((beta2 - 0.24390243902439027).abs() < 1e-14);
+        assert!((beta - beta2.sqrt()).abs() < 1e-14);
+        assert!((beta - 0.49386479832479485).abs() < 1e-14);
     }
 
     #[test]
