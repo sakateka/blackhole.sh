@@ -612,12 +612,11 @@ const BIG_F0: (f64, f64) = (0.58, 0.70);
 const BIG_DRAG: f64 = INFALL_DRAG * 0.25;
 /// the superstar: a parked giant several times the massive star's size,
 /// held dead-still in the world frame while its envelope pours into the
-/// hole through one long funnel. Every parcel is launched from the same
-/// spot the same way, so they all trace the same arc and the stream reads
-/// as a single coherent vortex - wide where it leaves the donor, a thin
-/// spout by the time it pours past the horizon - instead of a dispersing
-/// cloud. The frame never rotates: only the flow inside the funnel moves,
-/// and the drain plays out over tens of minutes.
+/// hole through one long funnel. The default and spiral profiles keep a
+/// coherent arc; the tidal profile gives each debris parcel a small spread
+/// in energy and angular momentum, so it reads as a continuous sheared stream
+/// rather than a row of projectiles. The frame never rotates: only the flow
+/// inside the funnel moves, and the drain plays out over tens of minutes.
 const SUPER_SC: f64 = 6.0;
 /// where the donor sits (world frame): on the far side of the hole and
 /// well off to the side of the view axis, so its glow stays a compact
@@ -628,11 +627,38 @@ const SUPER_PARK_R: f64 = 25.8;
 /// envelope mass bled into the funnel per second: at this rate the star
 /// still keeps most of itself after ten minutes of watching
 const SUPER_SHED_RATE: f64 = 0.00045;
+/// The simulation keeps a tiny numerical core, but it is no longer rendered
+/// as a star once the donor has been drained.
+const SUPER_MIN_MASS: f64 = 0.05;
 /// mass (and glow weight) of one shed parcel, and how many may be in
-/// flight at once - a parcel every ~0.9 s strung along the arc is what
-/// makes the funnel read as continuous
-const SUPER_SHED_W: f64 = 0.0004;
+/// flight at once. Smaller parcels make the visible ribbon denser without
+/// increasing the number of live glow deposits (they are grouped below).
+const SUPER_SHED_W: f64 = 0.0002;
 const SUPER_STREAM_MAX: usize = 160;
+/// Number of neighbouring funnel parcels represented by one deposited glow.
+/// Keeping this small preserves the shape while avoiding a full-grid deposit
+/// for every microscopic parcel.
+const SUPER_STREAM_GROUP: usize = 4;
+/// The tidal profile is a debris stream, not a set of luminous bullets. Its
+/// sheared launch distribution and bounded grouping keep the mass distribution
+/// visually continuous while retaining the same total transfer rate.
+const TIDAL_SHED_W: f64 = 0.0002;
+const TIDAL_STREAM_MAX: usize = 160;
+const TIDAL_STREAM_GROUP: usize = 4;
+const TIDAL_STREAM_BRI: f64 = 260.0;
+/// Guard the approximation against widely separated/unstable parcels. A
+/// funnel glow larger than this would illuminate most of the cached ray grid
+/// and both wash out the image and destroy the frame time.
+const SUPER_STREAM_SIG_MAX: f64 = 2.4;
+/// A Gaussian contribution this far from a glow is below terminal colour
+/// quantisation for stream-sized sources. Bright stellar glows use a wider
+/// safety margin; the exact integrator remains in use for every retained
+/// segment.
+const GLOW_CUTOFF_DIM: f64 = 4.0;
+const GLOW_CUTOFF_BRIGHT: f64 = 7.0;
+/// The traced adaptive step is at most 1.1 scene units; this conservative
+/// half-length keeps the midpoint reject from excluding any retained segment.
+const GLOW_SEG_HALF_MAX: f64 = 1.0;
 /// how the funnel leaves the donor: mostly tangential (perpendicular to
 /// the star-hole line), a touch toward the hole - enough sideways speed
 /// to swing a long arc around, little enough to keep diving inward
@@ -643,8 +669,10 @@ const SUPER_FUN_G: f64 = 0.10;
 /// pours past the horizon) and shines far brighter per unit mass, which
 /// is the only way a deliberately slow drain stays visible at all
 const SUPER_STREAM_DRAG: f64 = 0.010;
-const SUPER_STREAM_BRI: f64 = 220.0;
-const SUPER_STREAM_LIFE: f64 = 300.0;
+// The default and spiral streams are rendered as paired, enlarged glows
+// (see `glow_list`), so this is brightness per pair rather than brightness
+// of an individual dot. The tidal profile supplies its own dimmer value.
+const SUPER_STREAM_BRI: f64 = 420.0;
 /// the funnel's gaussian radius at the spout (by the hole) and at the
 /// throat (by the star)
 const SUPER_SIG_TIP: f64 = 0.5;
@@ -652,11 +680,15 @@ const SUPER_SIG_ROOT: f64 = 1.25;
 /// the donor's near-side envelope is stretched toward the hole as a smooth
 /// lobe before the moving parcels take over
 const SUPER_STRETCH_LEN: f64 = 6.5;
-const SUPER_STRETCH_N: usize = 10;
+const SUPER_STRETCH_N: usize = 4;
 /// how fast the massive star is torn apart inside its tidal radius
 const INFALL_STRIP: f64 = 2.5;
-/// how long a shed stream particle keeps glowing
+/// how long a normal shed stream particle keeps glowing
 const STREAM_LIFE: f64 = 6.0;
+/// Superstar parcels are material in the persistent funnel, not fading
+/// after-images: they stay until they cross the horizon. The test uses its
+/// own finite horizon below.
+const SUPER_STREAM_LIFE: f64 = f64::INFINITY;
 /// stream particles alive at once, tops
 const STREAM_MAX: usize = 24;
 const STREAM_BRI: f64 = 6.0;
@@ -828,14 +860,99 @@ fn deposit_one(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut dyn FnMut(usi
     let cell = |v: f64| (((v / BIN_W).floor() as isize) + BIN_C).clamp(0, BIN_N as isize - 1);
     let (gx, gy, gz) = (cell(gl.p.x), cell(gl.p.y), cell(gl.p.z));
     let last = BIN_N as isize - 1;
+
+    // `bin_of` indexes a segment by its midpoint. Reject a bin when its
+    // axis-aligned box cannot intersect the same radial shell as the glow.
+    // This is conservative (and therefore does not change the deposited
+    // image), but avoids walking the segment slice in most of the cube bins
+    // that the old rectangular neighbourhood included merely by shape.
+    let axis_bounds = |i: isize| {
+        if i == 0 || i == last {
+            // The bin index is clamped at the cube boundary. Recorded
+            // segments can consequently lie beyond the nominal edge.
+            (0.0, GLOW_R * GLOW_R)
+        } else {
+            let lo = (i - BIN_C) as f64 * BIN_W;
+            let hi = lo + BIN_W;
+            let lo2 = lo * lo;
+            let hi2 = hi * hi;
+            let min2 = if lo <= 0.0 && hi >= 0.0 {
+                0.0
+            } else {
+                lo2.min(hi2)
+            };
+            (min2, lo2.max(hi2))
+        }
+    };
+    let inner = (gr - rej - 1e-4).max(0.0);
+    let outer = gr + rej + 1e-4;
+    let inner2 = inner * inner;
+    let outer2 = outer * outer;
+    let peak = gl.c[0].max(gl.c[1]).max(gl.c[2]);
+    let cutoff = if peak < 1.0 {
+        GLOW_CUTOFF_DIM
+    } else {
+        GLOW_CUTOFF_BRIGHT
+    };
+    let reach = cutoff * gl.sig + GLOW_SEG_HALF_MAX;
+    let reach2 = reach * reach;
+    // The same conservative query, this time around the glow's actual
+    // position rather than around the hole. It removes corner bins from the
+    // rectangular neighbourhood before touching their segment slices.
+    let point_axis_min = |i: isize, p: f64| {
+        if i == 0 || i == last {
+            // Clamped edge bins may contain points beyond the nominal cube.
+            0.0
+        } else {
+            let lo = (i - BIN_C) as f64 * BIN_W;
+            let hi = lo + BIN_W;
+            if p < lo {
+                (p - lo) * (p - lo)
+            } else if p > hi {
+                (p - hi) * (p - hi)
+            } else {
+                0.0
+            }
+        }
+    };
+    let mut xdist = [0.0; BIN_N];
+    let mut ydist = [0.0; BIN_N];
+    let mut zdist = [0.0; BIN_N];
+    for i in 0..BIN_N {
+        xdist[i] = point_axis_min(i as isize, gl.p.x);
+        ydist[i] = point_axis_min(i as isize, gl.p.y);
+        zdist[i] = point_axis_min(i as isize, gl.p.z);
+    }
     for z in (gz - range).max(0)..=(gz + range).min(last) {
+        let (zmin, zmax) = axis_bounds(z);
         for y in (gy - range).max(0)..=(gy + range).min(last) {
+            let (ymin, ymax) = axis_bounds(y);
             for x in (gx - range).max(0)..=(gx + range).min(last) {
+                if xdist[x as usize] + ydist[y as usize] + zdist[z as usize] > reach2 {
+                    continue;
+                }
+                let (xmin, xmax) = axis_bounds(x);
+                if ymin + zmin + xmin > outer2 || ymax + zmax + xmax < inner2 {
+                    continue;
+                }
                 let b = (x + BIN_N as isize * (y + BIN_N as isize * z)) as usize;
                 for s in &segs[bin_off[b] as usize..bin_off[b + 1] as usize] {
                     // cheap radial pre-reject: the glow lives in a shell
                     // around the hole at its own radius
                     if (s.r as f64 - gr).abs() > rej + 1e-4 {
+                        continue;
+                    }
+                    // The Gaussian never reaches mathematical zero. The
+                    // midpoint bound drops only tails below display
+                    // quantisation, before paying for the two erf lookups
+                    // and the exponential in the exact weight.
+                    let mx = s.p0[0] as f64 + 0.5 * s.sg[0] as f64;
+                    let my = s.p0[1] as f64 + 0.5 * s.sg[1] as f64;
+                    let mz = s.p0[2] as f64 + 0.5 * s.sg[2] as f64;
+                    let dx = gl.p.x - mx;
+                    let dy = gl.p.y - my;
+                    let dz = gl.p.z - mz;
+                    if dx * dx + dy * dy + dz * dz > reach2 {
                         continue;
                     }
                     let e = segment_glow_weight(gl, s, erf_t);
@@ -872,7 +989,12 @@ impl GlowBuf {
 
 struct GlowCache {
     bufs: Vec<GlowBuf>,
+    /// Pixels lit by the current deposition.
     lit: Vec<u32>,
+    /// Pixels lit by the previous deposition and therefore dirty after clear.
+    previous_lit: Vec<u32>,
+    /// Sparse glow pixels are dynamic too, but do not belong in the trace mask.
+    mask: Vec<bool>,
     grid_len: usize,
 }
 
@@ -881,6 +1003,8 @@ impl GlowCache {
         GlowCache {
             bufs: Vec::new(),
             lit: Vec::new(),
+            previous_lit: Vec::new(),
+            mask: Vec::new(),
             grid_len: 0,
         }
     }
@@ -904,10 +1028,17 @@ fn deposit_glows(
     par: bool,
     nthreads: usize,
 ) {
-    // This also runs on the first empty frame. Otherwise the final deposited
-    // trail remains in Geo forever after its glows disappear.
-    for px in cache.lit.drain(..) {
+    // Clear the previous glow, but retain its coordinates until after this
+    // frame is shaded: those pixels must be redrawn once without the glow.
+    cache.previous_lit.clear();
+    cache.previous_lit.append(&mut cache.lit);
+    if cache.mask.len() != geo.len() {
+        cache.mask.clear();
+        cache.mask.resize(geo.len(), false);
+    }
+    for &px in &cache.previous_lit {
         geo[px as usize].st = [0.0; 3];
+        cache.mask[px as usize] = true;
     }
     if glows.is_empty() || segs.is_empty() {
         return;
@@ -1000,6 +1131,13 @@ fn tide(r: f64) -> f64 {
     1.0 + 9.0 * (RS / r) * (RS / r)
 }
 
+/// A parcel should fade before crossing the horizon instead of disappearing
+/// at full tidal brightness on one frame. This prevents the direct tidal
+/// profile from producing a pulse each time a discrete parcel is swallowed.
+fn funnel_horizon_fade(r: f64) -> f64 {
+    smoothstep(INFALL_SWALLOW, 2.6, r)
+}
+
 /// One parcel shed into a star's trail. Unlike a screen-space after-image it
 /// keeps moving under gravity, with reduced tangential speed and extra drag,
 /// until it crosses the horizon.
@@ -1063,6 +1201,8 @@ struct Infall {
     /// never moves, and only its funnel flows. No orbital integration,
     /// no trail, no horizon crossing - just the bleed.
     parked: bool,
+    /// Profile used by the superstar's shed material.
+    funnel: FunnelMode,
 }
 
 impl Infall {
@@ -1097,6 +1237,7 @@ impl Infall {
             ns: 0,
             debt: 0.0,
             parked: false,
+            funnel: FunnelMode::Current,
         }
     }
 
@@ -1153,13 +1294,22 @@ impl Infall {
                 // Roche-lobe overflow: the parked donor's envelope bleeds
                 // into the funnel - slowly, so the transfer lasts
                 let bleed = SUPER_SHED_RATE * h;
-                let next_mass = (self.m - bleed).max(0.05);
+                let next_mass = (self.m - bleed).max(SUPER_MIN_MASS);
                 self.debt += self.m - next_mass;
                 self.m = next_mass;
             }
+            if self.alive && self.sc > 5.5 && self.m <= SUPER_MIN_MASS {
+                // The donor is exhausted. Let already-launched material fade
+                // out briefly, then remove it normally; do not leave an
+                // immortal line after the star has finished feeding.
+                for stream in streams.iter_mut().filter(|stream| stream.fun) {
+                    stream.life = stream.life.min(stream.age + STREAM_LIFE);
+                }
+                self.alive = false;
+            }
             if self.alive && self.sc > 1.5 {
                 let (w0, cap, fun) = if self.sc > 5.5 {
-                    (SUPER_SHED_W, SUPER_STREAM_MAX, true)
+                    (self.funnel.shed_weight(), self.funnel.stream_cap(), true)
                 } else {
                     (0.02, STREAM_MAX, false)
                 };
@@ -1169,15 +1319,14 @@ impl Infall {
                 while self.debt > w0 && streams.len() < cap {
                     self.debt -= w0;
                     self.ns += 1;
-                    // the funnel leaves the donor through L1: mostly
-                    // tangential, nudged toward the hole, with a few per
-                    // cent of jitter so the ribbon breathes. Identical
-                    // launches make identical arcs - one coherent funnel
-                    // instead of a dispersing cloud
-                    let v = if fun {
+                    // The funnel leaves the donor through L1. Each profile
+                    // controls its orbital momentum; the tidal profile adds
+                    // a deterministic physical spread to the debris below.
+                    let (v, launch_offset) = if fun {
                         let r = self.p.len();
                         let vc = (INFALL_GM * r).sqrt() / (r - RS);
                         let rad = self.p.norm();
+                        let (fun_f, fun_g) = self.funnel.launch_factors();
                         let tangent = V3::new(0.0, 1.0, 0.0).cross(rad);
                         // top/bottom origins are parallel to world-up; use
                         // world-x there so the funnel still has a tangent
@@ -1186,21 +1335,60 @@ impl Infall {
                         } else {
                             tangent.norm()
                         };
-                        let k = (self.ns % 3) as f64 - 1.0;
-                        tan * (SUPER_FUN_F * vc * (1.0 + 0.05 * k)) - rad * (SUPER_FUN_G * vc)
+                        if self.funnel == FunnelMode::Tidal {
+                            // A disrupted star does not fire identical
+                            // projectiles. The debris inherits a small
+                            // spread in orbital energy, angular momentum and
+                            // height; gravity then shears that spread into a
+                            // broad, continuous stream. Keep the perturbation
+                            // deterministic so pausing or changing FPS does
+                            // not make the scene shimmer.
+                            let signed =
+                                |key: i64| hash3i(self.ns as i64, key, 0x071D_A1A1) * 2.0 - 1.0;
+                            let energy = 1.0 + 0.12 * signed(1);
+                            let angular = 1.0 + 0.10 * signed(2);
+                            let normal = rad.cross(tan);
+                            let v = tan * (fun_f * vc * energy * angular)
+                                - rad * (fun_g * vc * energy)
+                                + normal * (0.045 * vc * signed(3));
+                            let offset = tan * (0.10 * signed(4)) + normal * (0.10 * signed(5));
+                            (v, offset)
+                        } else {
+                            (
+                                tan * (fun_f * vc) - rad * (fun_g * vc),
+                                V3::new(0.0, 0.0, 0.0),
+                            )
+                        }
                     } else {
-                        self.v * (0.95 + 0.10 * (self.ns % 4) as f64)
+                        (
+                            self.v * (0.95 + 0.10 * (self.ns % 4) as f64),
+                            V3::new(0.0, 0.0, 0.0),
+                        )
                     };
                     streams.push(Stream {
-                        p: if fun { self.p * (1.0 - 0.02) } else { self.p },
+                        p: if fun {
+                            self.p * (1.0 - 0.02) + launch_offset
+                        } else {
+                            self.p
+                        },
                         v,
                         w: w0,
                         age: 0.0,
                         life: if fun { SUPER_STREAM_LIFE } else { STREAM_LIFE },
-                        drag: if fun { SUPER_STREAM_DRAG } else { INFALL_DRAG },
-                        bri: if fun { SUPER_STREAM_BRI } else { STREAM_BRI },
+                        drag: if fun {
+                            self.funnel.stream_drag()
+                        } else {
+                            INFALL_DRAG
+                        },
+                        bri: if fun {
+                            self.funnel.stream_brightness()
+                        } else {
+                            STREAM_BRI
+                        },
                         sig: STREAM_SIG,
                         fun,
+                        funnel: self.funnel,
+                        group: (self.ns - 1) / self.funnel.stream_group() as u64,
                     });
                 }
             }
@@ -1222,12 +1410,16 @@ struct Stream {
     /// its glow radius, and `fun` marks a funnel parcel (whose radius
     /// tapers toward the spout instead)
     w: f64,
+    /// Stable aggregation bucket. It prevents removing the oldest parcel
+    /// from shifting every subsequent group and making the line jump.
+    group: u64,
     age: f64,
     life: f64,
     drag: f64,
     bri: f64,
     sig: f64,
     fun: bool,
+    funnel: FunnelMode,
 }
 
 impl Stream {
@@ -1271,10 +1463,6 @@ struct Stars {
     /// remaining brightness and its (mass-shrunk) glow scale
     rem: Vec<Remnant>,
     seed: i64,
-    /// superstar mode: a swallowed stream parcel plants one small flash of
-    /// the same kind, so the accretion end of the bridge flickers as the
-    /// hole drinks
-    feed: bool,
 }
 
 impl Stars {
@@ -1284,7 +1472,6 @@ impl Stars {
             streams: Vec::new(),
             rem: Vec::new(),
             seed: 0,
-            feed: false,
         }
     }
 
@@ -1328,7 +1515,7 @@ impl Stars {
     /// diorama: the donor is parked at a fixed spot in the world frame,
     /// so the frame never moves - only the funnel between it and the hole
     /// does. `--origin` chooses the side on which that fixed donor is parked.
-    fn spawn_super(&mut self, origin: Option<Origin>, azi: f64, tilt: f64) {
+    fn spawn_super(&mut self, origin: Option<Origin>, azi: f64, tilt: f64, funnel: FunnelMode) {
         if self.live.iter().any(|inf| inf.sc > 5.5) {
             return;
         }
@@ -1345,15 +1532,14 @@ impl Stars {
             ns: 0,
             debt: 0.0,
             parked: true,
+            funnel,
         });
-        self.feed = true;
     }
 
     fn clear(&mut self) {
         self.live.clear();
         self.streams.clear();
         self.rem.clear();
-        self.feed = false;
     }
 
     /// Advance every star and stream in the static background potential; each
@@ -1363,32 +1549,11 @@ impl Stars {
             let h = dt.min(MATTER_STEP);
             let gm = INFALL_GM;
 
-            // Advance streams and existing remnants before stars. Material or
-            // remnants created by a star during this slice therefore start at
-            // the slice boundary instead of being aged by time before birth.
-            // A swallowed parcel plants a short flash just outside the photon
-            // sphere - the lensing smears it into an arc hugging the shadow.
-            let mut streams = std::mem::take(&mut self.streams);
-            streams.retain_mut(|stream| {
-                if stream.advance(h, gm) {
-                    return true;
-                }
-                if self.feed {
-                    let r = stream.p.len();
-                    let p = if r > 1e-9 {
-                        stream.p * (1.6 / r)
-                    } else {
-                        V3::new(1.6, 0.0, 0.0)
-                    };
-                    self.rem.push(Remnant {
-                        p,
-                        b: 750.0 * stream.w,
-                        sc: (600.0 * stream.w).cbrt(),
-                    });
-                }
-                false
-            });
-            self.streams = streams;
+            // Advance streams and existing remnants before stars. Material
+            // created by a star during this slice starts at the slice boundary
+            // instead of being aged before birth. A parcel vanishes cleanly at
+            // the horizon; it does not create a flickering flash at the hole.
+            self.streams.retain_mut(|stream| stream.advance(h, gm));
             let fade = (-h / (INFALL_FADE * 0.35)).exp();
             self.rem.retain_mut(|rem| {
                 rem.b *= fade;
@@ -1399,7 +1564,7 @@ impl Stars {
             while i < self.live.len() {
                 let was_alive = self.live[i].alive;
                 let keep = self.live[i].advance(h, gm, &mut self.streams);
-                if was_alive && !self.live[i].alive {
+                if was_alive && !self.live[i].alive && !self.live[i].parked {
                     let inf = &self.live[i];
                     let r = inf.p.len();
                     let p = if r > 1e-9 {
@@ -1438,9 +1603,21 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
         // or brighter blob would wash the frame whenever it sweeps near the
         // camera, and a bigger radius would reach past the shell of recorded
         // segments (GLOW_R) that the binned deposition scans
-        let scl = inf.sc * inf.m.cbrt();
-        let vis = scl.min(4.5);
-        let sig_scl = scl.min(2.2);
+        let mass_scale = inf.m.cbrt();
+        let scl = inf.sc * mass_scale;
+        // The exhausted parked donor is a numerical bookkeeping core, not a
+        // visible object. Its launched stream is allowed to finish fading.
+        if inf.parked && inf.sc > 5.5 && inf.m <= SUPER_MIN_MASS {
+            continue;
+        }
+        // The old caps made the superstar look frozen: its six-unit size was
+        // clamped to the same visual size until almost all mass was gone.
+        // Keep the initial cap for performance, but scale from frame one.
+        let (vis, sig_scl) = if inf.sc > 5.5 {
+            (4.5 * mass_scale, 2.2 * mass_scale)
+        } else {
+            (scl.min(4.5), scl.min(2.2))
+        };
         if inf.alive {
             let head = heat(0.85);
             let w = INFALL_HEAD_BRI * tide(inf.p.len()) * vis;
@@ -1455,15 +1632,16 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
                 // so the funnel visibly grows out of the star instead of
                 // beginning as a disconnected bead.
                 let radial = inf.p.norm();
-                for i in 0..SUPER_STRETCH_N {
-                    let u = (i + 1) as f64 / SUPER_STRETCH_N as f64;
-                    let distance = 0.65 + SUPER_STRETCH_LEN * u;
+                let stretch_len = inf.funnel.stretch_len() * mass_scale;
+                for i in 0..inf.funnel.stretch_n() {
+                    let u = (i + 1) as f64 / inf.funnel.stretch_n() as f64;
+                    let distance = 0.65 * mass_scale + stretch_len * u;
                     let p = inf.p - radial * distance;
-                    let lobe_w = w * mix(0.46, 0.10, u);
+                    let lobe_w = w * inf.funnel.stretch_weight(u);
                     g.push(Glow {
                         p: rot(p),
                         c: [head[0] * lobe_w, head[1] * lobe_w, head[2] * lobe_w],
-                        sig: mix(SUPER_SIG_ROOT, SUPER_SIG_TIP, u),
+                        sig: mix(SUPER_SIG_ROOT, SUPER_SIG_TIP, u) * mass_scale,
                     });
                 }
             }
@@ -1481,27 +1659,74 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
             });
         }
     }
-    // the mass the massive star sheds: a cooler string of glows, each
-    // fading with age
-    for stm in &st.streams {
-        let b = 1.0 - stm.age / stm.life;
-        let w = stm.bri * stm.w * b * tide(stm.p.len());
-        // the funnel is a fat tongue where it leaves the donor and a thin
-        // spout by the time it pours into the hole
-        let sig = if stm.fun {
-            mix(
-                SUPER_SIG_TIP,
-                SUPER_SIG_ROOT,
-                (stm.p.len() / SUPER_PARK_R).min(1.0),
-            )
-        } else {
-            stm.sig
-        };
-        g.push(Glow {
-            p: rot(stm.p),
-            c: [w, 0.75 * w, 0.45 * w],
-            sig,
-        });
+    // The mass the massive star sheds: a cooler string of glows, each fading
+    // with age. Adjacent funnel parcels are combined into one enlarged glow;
+    // the tidal profile uses a sheared launch distribution and the group's
+    // positional variance so the result is a diffuse debris ribbon instead
+    // of luminous bullets. Grouping keeps the expensive glow-deposition work
+    // bounded.
+    let mut si = 0;
+    while si < st.streams.len() {
+        let first = &st.streams[si];
+        if !first.fun {
+            let b = 1.0 - first.age / first.life;
+            let w = first.bri * first.w * b * tide(first.p.len());
+            g.push(Glow {
+                p: rot(first.p),
+                c: [w, 0.75 * w, 0.45 * w],
+                sig: first.sig,
+            });
+            si += 1;
+            continue;
+        }
+
+        // Group by the parcel's stable bucket, not by its current index. If
+        // the oldest parcel is swallowed, index-based groups would all shift
+        // and make the entire visible line jump sideways.
+        let mut end = si + 1;
+        while end < st.streams.len()
+            && end - si < first.funnel.stream_group()
+            && st.streams[end].fun
+            && st.streams[end].group == first.group
+        {
+            end += 1;
+        }
+        let mut weight = 0.0;
+        let mut position = V3::new(0.0, 0.0, 0.0);
+        let mut sig2 = 0.0;
+        let mut second_moment = 0.0;
+        for stm in &st.streams[si..end] {
+            let b = 1.0 - stm.age / stm.life;
+            let horizon = funnel_horizon_fade(stm.p.len());
+            let w = stm.bri * stm.w * b * stm.funnel.stream_gain(stm.p.len()) * horizon;
+            let sig = stm.funnel.stream_sig(stm.p.len());
+            weight += w;
+            position = position + stm.p * w;
+            sig2 += sig * sig * w;
+            second_moment += stm.p.len2() * w;
+        }
+        if weight > 0.0 {
+            position = position * weight.recip();
+            // The tidal profile's grouped glow also carries the positional
+            // variance of its parcels. This smooths the denser simulation
+            // into a diffuse tube without depositing one glow per particle;
+            // the cap keeps a wrapped group from lighting the whole frame.
+            let variance = (second_moment * weight.recip() - position.len2()).max(0.0);
+            let group_spread = if first.funnel == FunnelMode::Tidal {
+                0.75 * variance
+            } else {
+                0.0
+            };
+            let sig = (sig2 * weight.recip() + group_spread)
+                .sqrt()
+                .clamp(0.35, SUPER_STREAM_SIG_MAX.min(1.5));
+            g.push(Glow {
+                p: rot(position),
+                c: [weight, 0.75 * weight, 0.45 * weight],
+                sig,
+            });
+        }
+        si = end;
     }
     for rem in &st.rem {
         let col = heat(0.95);
@@ -1844,6 +2069,139 @@ enum Mode {
     Sixel,
 }
 
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum FunnelMode {
+    /// The geometry currently used before the selectable profiles were added.
+    Current,
+    /// A mostly radial tidal stream: broad at the donor and gently twisted.
+    Tidal,
+    /// A high-angular-momentum stream that wraps more tightly around the hole.
+    Spiral,
+}
+
+impl FunnelMode {
+    fn parse(value: &str) -> Option<FunnelMode> {
+        match value {
+            "current" | "default" | "0" => Some(FunnelMode::Current),
+            "tidal" | "tidal-stream" | "1" => Some(FunnelMode::Tidal),
+            "spiral" | "spiral-funnel" | "2" => Some(FunnelMode::Spiral),
+            _ => None,
+        }
+    }
+
+    /// Fractions of the local circular speed: tangential and inward radial.
+    fn launch_factors(self) -> (f64, f64) {
+        match self {
+            // Preserve the original almost-tangential funnel exactly.
+            FunnelMode::Current => (SUPER_FUN_F, SUPER_FUN_G),
+            // A tidal stream keeps more of the star's orbital momentum. It
+            // therefore curves around the hole instead of looking like a
+            // nozzle aimed straight at it.
+            FunnelMode::Tidal => (0.62, 0.32),
+            // Nearly circular launch: the stream spends longer wrapping
+            // around the hole before the drag brings it in.
+            FunnelMode::Spiral => (0.98, 0.04),
+        }
+    }
+
+    /// Keep the simulation parcel size bounded; the tidal profile gets its
+    /// smooth appearance from launch shear and grouped spatial variance, not
+    /// from multiplying the number of render sources.
+    fn shed_weight(self) -> f64 {
+        match self {
+            FunnelMode::Tidal => TIDAL_SHED_W,
+            FunnelMode::Current | FunnelMode::Spiral => SUPER_SHED_W,
+        }
+    }
+
+    fn stream_cap(self) -> usize {
+        match self {
+            FunnelMode::Tidal => TIDAL_STREAM_MAX,
+            FunnelMode::Current | FunnelMode::Spiral => SUPER_STREAM_MAX,
+        }
+    }
+
+    fn stream_group(self) -> usize {
+        match self {
+            FunnelMode::Tidal => TIDAL_STREAM_GROUP,
+            FunnelMode::Current | FunnelMode::Spiral => SUPER_STREAM_GROUP,
+        }
+    }
+
+    /// Tidal debris is mostly ballistic; the other profiles use the original
+    /// stronger coupling so their deliberately compact funnels settle inward.
+    fn stream_drag(self) -> f64 {
+        match self {
+            FunnelMode::Tidal => 0.003,
+            FunnelMode::Current | FunnelMode::Spiral => SUPER_STREAM_DRAG,
+        }
+    }
+
+    /// Lower per-particle emissivity prevents the debris from reading as a
+    /// set of energy bolts while keeping its total luminosity tied to the
+    /// same mass-transfer rate.
+    fn stream_brightness(self) -> f64 {
+        match self {
+            FunnelMode::Tidal => TIDAL_STREAM_BRI,
+            FunnelMode::Current | FunnelMode::Spiral => SUPER_STREAM_BRI,
+        }
+    }
+
+    /// A real tidal stream can shock and brighten near pericentre, but it
+    /// should not have the very sharp inverse-square pulse used by the
+    /// theatrical funnel profiles.
+    fn stream_gain(self, radius: f64) -> f64 {
+        match self {
+            FunnelMode::Tidal => 1.0 + 3.0 * (RS / radius) * (RS / radius),
+            FunnelMode::Current | FunnelMode::Spiral => tide(radius),
+        }
+    }
+
+    /// Gaussian radius along the funnel, wider at the donor than at the tip.
+    fn stream_sig(self, radius: f64) -> f64 {
+        let fraction = (radius / SUPER_PARK_R).clamp(0.0, 1.0);
+        match self {
+            FunnelMode::Current => mix(SUPER_SIG_TIP, SUPER_SIG_ROOT, fraction),
+            FunnelMode::Tidal => mix(0.38, 1.10, fraction),
+            FunnelMode::Spiral => mix(0.42, 0.95, fraction),
+        }
+    }
+
+    /// The direct donor lobe should not hide the spiral profile. The tidal
+    /// profile gets only a short, dim envelope extension; its debris stream
+    /// should be the visible continuation rather than a straight beam.
+    fn stretch_len(self) -> f64 {
+        match self {
+            FunnelMode::Current => SUPER_STRETCH_LEN,
+            FunnelMode::Tidal => 2.8,
+            FunnelMode::Spiral => 2.8,
+        }
+    }
+
+    fn stretch_n(self) -> usize {
+        match self {
+            FunnelMode::Current => SUPER_STRETCH_N,
+            FunnelMode::Tidal => 6,
+            FunnelMode::Spiral => 6,
+        }
+    }
+
+    fn stretch_weight(self, u: f64) -> f64 {
+        match self {
+            FunnelMode::Current | FunnelMode::Spiral => mix(0.46, 0.10, u),
+            FunnelMode::Tidal => mix(0.22, 0.04, u),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            FunnelMode::Current => "current",
+            FunnelMode::Tidal => "tidal",
+            FunnelMode::Spiral => "spiral",
+        }
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Origin {
     Left,
@@ -1892,6 +2250,8 @@ fn super_park(origin: Option<Origin>, azi: f64, tilt: f64) -> V3 {
 
 struct Opt {
     mode: Mode,
+    /// Shape of the funnel created by --super-star.
+    funnel: FunnelMode,
     fps: f64,
     zoom: f64,
     speed: f64,
@@ -1937,6 +2297,7 @@ fn parse_opt() -> Opt {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut o = Opt {
         mode: Mode::Ascii,
+        funnel: FunnelMode::Current,
         fps: 30.0,
         zoom: 1.0,
         speed: 1.0,
@@ -1965,6 +2326,19 @@ fn parse_opt() -> Opt {
             "--star" => o.star = true,
             "--big-star" | "--big-start" => o.big_star = true,
             "--super-star" | "--superstar" => o.super_star = true,
+            "--funnel" => {
+                i += 1;
+                match args.get(i).and_then(|v| FunnelMode::parse(v)) {
+                    Some(funnel) => o.funnel = funnel,
+                    None => {
+                        eprintln!(
+                            "unknown funnel: {:?} (use current|tidal|spiral)",
+                            args.get(i)
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             "-m" | "--mode" => {
                 i += 1;
                 match args.get(i).map(|v| v.as_str()) {
@@ -2089,6 +2463,8 @@ OPTIONS
                         frame, pouring one long luminous funnel into the hole -
                         the frame never rotates, only the flow moves, and the
                         drain takes tens of minutes (s/S add normal stars)
+      --funnel <shape>  superstar funnel: current|tidal|spiral (default: current)
+                        tidal = diffuse sheared debris; spiral = stronger wrap
       --origin <side>   side the star dives in from: left|right|top|bottom|front|back
                         (default: random per star; the first star dives in from the left)
       --star-speed <n>  initial star speed as a fraction of the local circular
@@ -2378,6 +2754,8 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
         // The re-trace overwrites every Geo entry, so old glow indices no
         // longer identify state that needs an explicit clear.
         cache.glow.lit.clear();
+        cache.glow.previous_lit.clear();
+        cache.glow.mask.clear();
         // same reuse story as the pixel buffer: a stable-size re-trace (zoom)
         // overwrites every entry anyway
         if cache.geo.len() != w * h {
@@ -2460,6 +2838,11 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
             par,
             nthreads,
         );
+        // `deposit_glows` has populated `lit`; make both old and new glow
+        // pixels eligible for the cheap shading pass below.
+        for &px in &cache.glow.lit {
+            cache.glow.mask[px as usize] = true;
+        }
     }
 
     // P-frame: re-shade the cached geometry for the current time and azimuth.
@@ -2482,23 +2865,34 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
     // previous value; on the first frame or after a re-trace everything is
     // shaded so the buffer is fully written. The mask carries the decision
     // so this pass streams 320 KB, not the whole geometry cache.
-    let skip_static = !invalidated && !resized && orbit == 0.0 && !(glow_now || cache.glow_was);
+    // Glow pixels are sparse dynamic pixels. Keep the normal trace mask for
+    // disk/star animation, and add only the pixels touched by the glow pass.
+    let skip_static = !invalidated && !resized && orbit == 0.0;
     // glow-lit pixels are not in the trace-time mask, so while any glow is
     // live (and for one frame after the last one dies) everything is
     // re-shaded; once the residual is cleared the cheap masked path is
     // valid again
     cache.glow_was = glow_now;
+    if cache.glow.mask.len() != cache.geo.len() {
+        cache.glow.mask.clear();
+        cache.glow.mask.resize(cache.geo.len(), false);
+    }
     let geo = &cache.geo;
+    let glow_mask = &cache.glow.mask;
     if par {
         thread::scope(|sc| {
-            for (n, band) in px.chunks_mut(rows_per * w).enumerate() {
+            for (n, ((band, mband), gmband)) in px
+                .chunks_mut(rows_per * w)
+                .zip(cache.mask.chunks(rows_per * w))
+                .zip(glow_mask.chunks(rows_per * w))
+                .enumerate()
+            {
                 let src = &geo[n * rows_per * w..];
-                let mband = &cache.mask[n * rows_per * w..];
                 let ctx = &ctx;
                 sc.spawn(move || {
                     if skip_static {
-                        for ((p, m), g) in band.iter_mut().zip(mband).zip(src) {
-                            if !*m {
+                        for (((p, m), gm), g) in band.iter_mut().zip(mband).zip(gmband).zip(src) {
+                            if !(*m || *gm) {
                                 continue;
                             }
                             *p = shade(g, ctx);
@@ -2512,8 +2906,13 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
             }
         });
     } else if skip_static {
-        for ((p, m), g) in px.iter_mut().zip(cache.mask.iter()).zip(geo.iter()) {
-            if !*m {
+        for (((p, m), gm), g) in px
+            .iter_mut()
+            .zip(cache.mask.iter())
+            .zip(glow_mask.iter())
+            .zip(geo.iter())
+        {
+            if !(*m || *gm) {
                 continue;
             }
             *p = shade(g, &ctx);
@@ -2523,6 +2922,13 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
             *p = shade(g, &ctx);
         }
     }
+
+    // The previous glow pixels were redrawn above after their old `st` value
+    // was cleared. Keep only the current deposition in the sparse mask.
+    for &px in &cache.glow.previous_lit {
+        cache.glow.mask[px as usize] = false;
+    }
+    cache.glow.previous_lit.clear();
 }
 
 fn push_u32(out: &mut String, mut v: u32) {
@@ -2665,7 +3071,8 @@ fn cell_rgb(o: &Opt, c: &[f64]) -> [u8; 3] {
 fn draw_ascii(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
     let ramp = &o.ramp;
     let cw = f.w / SUB_X;
-    let ch = f.h / SUB_Y;
+    // Keep the terminal's last row for the unobtrusive status line.
+    let ch = (f.h / SUB_Y).min(o.rows.saturating_sub(1));
     let mut cells = Vec::with_capacity(cw * ch);
     for cy in 0..ch {
         for cx in 0..cw {
@@ -2706,7 +3113,8 @@ fn dot_bit(sx: usize, sy: usize) -> u8 {
 
 fn draw_braille(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
     let cw = f.w / SUB_X;
-    let ch = f.h / SUB_Y;
+    // Keep the terminal's last row for the unobtrusive status line.
+    let ch = (f.h / SUB_Y).min(o.rows.saturating_sub(1));
     let mut cells = Vec::with_capacity(cw * ch);
     for cy in 0..ch {
         for cx in 0..cw {
@@ -2751,17 +3159,50 @@ fn draw_braille(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
     scr.emit(o, &cells, cw, ch, out);
 }
 
+/// Draw a quiet one-line status bar in the last terminal row. It deliberately
+/// has no background or inverse attribute, and uses a dim neutral grey so it
+/// does not compete with the scene.
+fn draw_status(o: &Opt, out: &mut String, t: f64, paused: bool) {
+    let state = if paused { " | paused" } else { "" };
+    let text = format!(
+        " funnel:{} | speed:{:.2}x | zoom:{:.2} | tilt:{:+.1}° | orbit:{:+.1}°/s{} | t:{:.1}",
+        o.funnel.name(),
+        o.speed,
+        o.zoom,
+        o.tilt,
+        o.orbit,
+        state,
+        t
+    );
+    let width = o.cols.max(1);
+    let visible: String = text.chars().take(width).collect();
+    out.push_str("\x1b[");
+    push_u32(out, o.rows.max(1) as u32);
+    out.push_str(";1H");
+    if o.color {
+        out.push_str("\x1b[38;2;72;72;72m");
+    }
+    out.push_str(&visible);
+    for _ in visible.chars().count()..width {
+        out.push(' ');
+    }
+    if o.color {
+        out.push_str("\x1b[0m");
+    }
+}
+
 /// Sixel sky cutoff: pixels dimmer than this are dropped outright. The faint
 /// specks it removes are near-invisible but each one costs a colour strip and
 /// broken run-length compression in every band it touches.
 const SIXEL_SKY_CUT: f64 = 0.17;
 
-fn draw_sixel(o: &Opt, f: &Frame, out: &mut String) {
+fn draw_sixel(o: &Opt, f: &Frame, out: &mut String, t: f64, paused: bool) {
     // Sixel paints device pixels, so map the ray grid up to the target size
     // (nearest neighbour) instead of drawing the picture a fifth of the
-    // window wide.
+    // window wide. Reserve the last terminal row for the status line.
     let tw = o.tpw;
-    let th = o.tph;
+    let cell_h = (o.tph / o.rows.max(1)).max(1);
+    let th = o.tph.saturating_sub(cell_h).max(6);
     let mut col: Vec<usize> = vec![0; tw];
     (0..tw).for_each(|x| {
         col[x] = x * f.w / tw.max(1);
@@ -2869,6 +3310,7 @@ fn draw_sixel(o: &Opt, f: &Frame, out: &mut String) {
         }
     }
     out.push_str("\x1b\\");
+    draw_status(o, out, t, paused);
 }
 
 /// 216-cube index of a colour (0..215)
@@ -2916,7 +3358,7 @@ fn main() {
         let mut cache = GeoCache::new();
         let mut stars = Stars::new();
         if o.super_star {
-            stars.spawn_super(o.origin, o.azi, o.tilt);
+            stars.spawn_super(o.origin, o.azi, o.tilt, o.funnel);
             stars.advance(t);
         } else if o.big_star || o.star {
             stars.spawn(o.big_star, &o);
@@ -2926,7 +3368,7 @@ fn main() {
         let glows = glow_list(&stars, o.azi);
         render_frame(&o, t, &mut f, &mut cache, &glows);
         let mut scr = Screen::new();
-        draw_into(&o, &f, &mut out, &mut scr);
+        draw_into(&o, &f, &mut out, &mut scr, t, false);
         println!("{out}");
         return;
     }
@@ -2948,7 +3390,7 @@ fn main() {
     let mut cache = GeoCache::new();
     let mut stars = Stars::new();
     if o.super_star {
-        stars.spawn_super(o.origin, o.azi, o.tilt);
+        stars.spawn_super(o.origin, o.azi, o.tilt, o.funnel);
     } else if o.big_star || o.star {
         stars.spawn(o.big_star, &o);
     }
@@ -2966,7 +3408,7 @@ fn main() {
             render_frame(&o, t, &mut f, &mut cache, &glows);
             out.clear();
             out.push_str("\x1b[H");
-            draw_into(&o, &f, &mut out, &mut scr);
+            draw_into(&o, &f, &mut out, &mut scr, t, paused);
             let _ = so.write_all(out.as_bytes());
             let _ = so.flush();
             drawn = true;
@@ -3041,11 +3483,17 @@ fn main() {
     let _ = so.flush();
 }
 
-fn draw_into(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
+fn draw_into(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen, t: f64, paused: bool) {
     match o.mode {
-        Mode::Ascii => draw_ascii(o, f, out, scr),
-        Mode::Braille => draw_braille(o, f, out, scr),
-        Mode::Sixel => draw_sixel(o, f, out),
+        Mode::Ascii => {
+            draw_ascii(o, f, out, scr);
+            draw_status(o, out, t, paused);
+        }
+        Mode::Braille => {
+            draw_braille(o, f, out, scr);
+            draw_status(o, out, t, paused);
+        }
+        Mode::Sixel => draw_sixel(o, f, out, t, paused),
     }
 }
 
@@ -3094,6 +3542,7 @@ mod tests {
             ns: 0,
             debt: 0.0,
             parked: false,
+            funnel: FunnelMode::Current,
         });
         stars
     }
@@ -3290,6 +3739,8 @@ mod tests {
             bri: STREAM_BRI,
             sig: STREAM_SIG,
             fun: false,
+            funnel: FunnelMode::Current,
+            group: 0,
         };
         let before = stream.p;
 
@@ -3325,6 +3776,7 @@ mod tests {
             ns: 0,
             debt: 0.0,
             parked: false,
+            funnel: FunnelMode::Current,
         };
         let mut stars = Stars::new();
         stars.live.push(make(V3::new(1.16, 0.0, 0.0)));
@@ -3431,12 +3883,32 @@ mod tests {
     }
 
     #[test]
+    fn tidal_profile_uses_dense_sheared_debris() {
+        assert!(FunnelMode::Tidal.shed_weight() <= FunnelMode::Current.shed_weight());
+        assert!(FunnelMode::Tidal.stream_group() <= FunnelMode::Current.stream_group());
+        assert!(FunnelMode::Tidal.stream_gain(2.0) < tide(2.0));
+
+        let mut stars = Stars::new();
+        stars.spawn_super(None, 0.0, CAM_TILT, FunnelMode::Tidal);
+        stars.advance(4.0);
+
+        assert!(stars.streams.len() > 8, "debris stream too sparse");
+        assert!(
+            stars
+                .streams
+                .windows(2)
+                .any(|pair| (pair[0].v - pair[1].v).len() > 1e-6),
+            "tidal parcels all follow the same ballistic path"
+        );
+    }
+
+    #[test]
     fn super_star_parks_and_bleeds_slowly_through_the_funnel() {
         let mut stars = Stars::new();
-        stars.spawn_super(None, 0.0, CAM_TILT);
+        stars.spawn_super(None, 0.0, CAM_TILT, FunnelMode::Current);
         assert_eq!(stars.live.len(), 1);
         // a second superstar never joins the first
-        stars.spawn_super(None, 0.0, CAM_TILT);
+        stars.spawn_super(None, 0.0, CAM_TILT, FunnelMode::Current);
         assert_eq!(stars.live.len(), 1);
 
         // ten simulated minutes: the donor never moves an inch - the frame
@@ -3451,7 +3923,7 @@ mod tests {
         let flown: f64 = st.streams.iter().map(|s| s.w).sum();
         assert!(inf.m + flown <= 1.0 + 1e-9);
         assert!(1.0 - inf.m > flown, "some mass must already be swallowed");
-        assert!(!st.rem.is_empty(), "the hole should have drunk by now");
+        assert!(st.rem.is_empty(), "the hole must not flash when it feeds");
     }
 
     #[test]
@@ -3471,9 +3943,21 @@ mod tests {
     }
 
     #[test]
+    fn superstar_glow_shrinks_with_remaining_mass() {
+        let mut stars = Stars::new();
+        stars.spawn_super(None, 0.0, CAM_TILT, FunnelMode::Current);
+        let full = glow_list(&stars, 0.0);
+        stars.live[0].m = 0.125;
+        let reduced = glow_list(&stars, 0.0);
+        assert!(reduced[0].sig < full[0].sig);
+        assert!(reduced[0].c[0] < full[0].c[0]);
+        assert!(reduced[1].sig < full[1].sig);
+    }
+
+    #[test]
     fn super_star_near_side_is_stretched_toward_the_hole() {
         let mut stars = Stars::new();
-        stars.spawn_super(None, 0.0, CAM_TILT);
+        stars.spawn_super(None, 0.0, CAM_TILT, FunnelMode::Current);
         let glows = glow_list(&stars, 0.0);
         assert_eq!(glows.len(), 1 + SUPER_STRETCH_N);
 
@@ -3509,24 +3993,28 @@ mod tests {
             bri: SUPER_STREAM_BRI,
             sig: STREAM_SIG,
             fun: true,
+            funnel: FunnelMode::Current,
+            group: 0,
         };
         // near the horizon the PW speeds are so high that a 0.25 s sample
         // can hop straight past the swallow radius, so the early exit is
         // the arrival proof, not a sampled minimum radius
         let mut t = 0.0;
-        while t < SUPER_STREAM_LIFE {
+        const TEST_HORIZON: f64 = 300.0;
+        while t < TEST_HORIZON {
             if !s.advance(0.25, INFALL_GM) {
                 break;
             }
             t += 0.25;
         }
         assert!(t > 20.0, "fell in too fast: t={t}");
-        assert!(t < SUPER_STREAM_LIFE, "parcel cooled mid-flight: t={t}");
+        assert!(t < TEST_HORIZON, "parcel did not arrive: t={t}");
     }
 
     #[test]
-    fn swallowed_parcels_flash_only_while_feeding() {
-        let mk = || Stream {
+    fn swallowed_parcels_do_not_flash_at_the_hole() {
+        let mut stars = Stars::new();
+        stars.streams.push(Stream {
             p: V3::new(2.0, 0.0, 0.0),
             v: V3::new(0.0, 0.0, 0.4),
             w: 0.01,
@@ -3536,22 +4024,12 @@ mod tests {
             bri: STREAM_BRI,
             sig: STREAM_SIG,
             fun: false,
-        };
-        let mut plain = Stars::new();
-        plain.streams.push(mk());
-        plain.advance(5.0);
-        assert!(plain.rem.is_empty());
-
-        let mut fed = Stars::new();
-        fed.feed = true;
-        fed.streams.push(mk());
-        fed.advance(0.5);
-        assert_eq!(fed.rem.len(), 1);
-        let rem = &fed.rem[0];
-        let full_fade = 7.5 * (-0.5 / (INFALL_FADE * 0.35)).exp();
-        assert!(rem.b < 7.5 && rem.b > full_fade - 1e-9);
-        assert!((rem.sc - (600.0_f64 * 0.01).cbrt()).abs() < 1e-12);
-        assert!((rem.p.len() - 1.6).abs() < 1e-9);
+            funnel: FunnelMode::Current,
+            group: 0,
+        });
+        stars.advance(0.5);
+        assert!(stars.streams.is_empty());
+        assert!(stars.rem.is_empty());
     }
 
     #[test]
