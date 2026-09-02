@@ -649,6 +649,10 @@ const SUPER_STREAM_LIFE: f64 = 300.0;
 /// throat (by the star)
 const SUPER_SIG_TIP: f64 = 0.5;
 const SUPER_SIG_ROOT: f64 = 1.25;
+/// the donor's near-side envelope is stretched toward the hole as a smooth
+/// lobe before the moving parcels take over
+const SUPER_STRETCH_LEN: f64 = 6.5;
+const SUPER_STRETCH_N: usize = 10;
 /// how fast the massive star is torn apart inside its tidal radius
 const INFALL_STRIP: f64 = 2.5;
 /// how long a shed stream particle keeps glowing
@@ -1174,31 +1178,26 @@ impl Infall {
                         let r = self.p.len();
                         let vc = (INFALL_GM * r).sqrt() / (r - RS);
                         let rad = self.p.norm();
-                        let tan = V3::new(0.0, 1.0, 0.0).cross(rad).norm();
+                        let tangent = V3::new(0.0, 1.0, 0.0).cross(rad);
+                        // top/bottom origins are parallel to world-up; use
+                        // world-x there so the funnel still has a tangent
+                        let tan = if tangent.len2() < 1e-12 {
+                            V3::new(1.0, 0.0, 0.0).cross(rad).norm()
+                        } else {
+                            tangent.norm()
+                        };
                         let k = (self.ns % 3) as f64 - 1.0;
                         tan * (SUPER_FUN_F * vc * (1.0 + 0.05 * k)) - rad * (SUPER_FUN_G * vc)
                     } else {
                         self.v * (0.95 + 0.10 * (self.ns % 4) as f64)
                     };
                     streams.push(Stream {
-                        p: if fun {
-                            self.p * (1.0 - 0.02)
-                        } else {
-                            self.p
-                        },
+                        p: if fun { self.p * (1.0 - 0.02) } else { self.p },
                         v,
                         w: w0,
                         age: 0.0,
-                        life: if fun {
-                            SUPER_STREAM_LIFE
-                        } else {
-                            STREAM_LIFE
-                        },
-                        drag: if fun {
-                            SUPER_STREAM_DRAG
-                        } else {
-                            INFALL_DRAG
-                        },
+                        life: if fun { SUPER_STREAM_LIFE } else { STREAM_LIFE },
+                        drag: if fun { SUPER_STREAM_DRAG } else { INFALL_DRAG },
                         bri: if fun { SUPER_STREAM_BRI } else { STREAM_BRI },
                         sig: STREAM_SIG,
                         fun,
@@ -1272,10 +1271,6 @@ struct Stars {
     /// remaining brightness and its (mass-shrunk) glow scale
     rem: Vec<Remnant>,
     seed: i64,
-    /// superstar mode: a swallowed stream parcel plants one small flash of
-    /// the same kind, so the accretion end of the bridge flickers as the
-    /// hole drinks
-    feed: bool,
 }
 
 impl Stars {
@@ -1285,7 +1280,6 @@ impl Stars {
             streams: Vec::new(),
             rem: Vec::new(),
             seed: 0,
-            feed: false,
         }
     }
 
@@ -1328,12 +1322,12 @@ impl Stars {
     /// The superstar is meant to be the whole show, and the show is a
     /// diorama: the donor is parked at a fixed spot in the world frame,
     /// so the frame never moves - only the funnel between it and the hole
-    /// does. One at a time.
-    fn spawn_super(&mut self) {
+    /// does. `--origin` chooses the side on which that fixed donor is parked.
+    fn spawn_super(&mut self, origin: Option<Origin>, azi: f64, tilt: f64) {
         if self.live.iter().any(|inf| inf.sc > 5.5) {
             return;
         }
-        let p = SUPER_PARK;
+        let p = super_park(origin, azi, tilt);
         self.live.push(Infall {
             p,
             v: V3::new(0.0, 0.0, 0.0),
@@ -1347,14 +1341,12 @@ impl Stars {
             debt: 0.0,
             parked: true,
         });
-        self.feed = true;
     }
 
     fn clear(&mut self) {
         self.live.clear();
         self.streams.clear();
         self.rem.clear();
-        self.feed = false;
     }
 
     /// Advance every star and stream in the static background potential; each
@@ -1367,31 +1359,7 @@ impl Stars {
             // Advance streams and existing remnants before stars. Material or
             // remnants created by a star during this slice therefore start at
             // the slice boundary instead of being aged by time before birth.
-            // A swallowed parcel plants a short flash just outside the photon
-            // sphere (in superstar mode, where the accretion end of the bridge
-            // is half the show) - the lensing smears it into an arc hugging
-            // the shadow, the same trick swallowed stars use.
-            let mut streams = std::mem::take(&mut self.streams);
-            streams.retain_mut(|stream| {
-                if stream.advance(h, gm) {
-                    return true;
-                }
-                if self.feed {
-                    let r = stream.p.len();
-                    let p = if r > 1e-9 {
-                        stream.p * (1.6 / r)
-                    } else {
-                        V3::new(1.6, 0.0, 0.0)
-                    };
-                    self.rem.push(Remnant {
-                        p,
-                        b: 750.0 * stream.w,
-                        sc: (600.0 * stream.w).cbrt(),
-                    });
-                }
-                false
-            });
-            self.streams = streams;
+            self.streams.retain_mut(|stream| stream.advance(h, gm));
             let fade = (-h / (INFALL_FADE * 0.35)).exp();
             self.rem.retain_mut(|rem| {
                 rem.b *= fade;
@@ -1452,6 +1420,24 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
                 c: [head[0] * w, head[1] * w, head[2] * w],
                 sig: INFALL_SIG * sig_scl,
             });
+            if inf.sc > 5.5 {
+                // Stretch the donor's near-side envelope itself toward the
+                // hole. These overlapping gaussians form one tapered lobe,
+                // so the funnel visibly grows out of the star instead of
+                // beginning as a disconnected bead.
+                let radial = inf.p.norm();
+                for i in 0..SUPER_STRETCH_N {
+                    let u = (i + 1) as f64 / SUPER_STRETCH_N as f64;
+                    let distance = 0.65 + SUPER_STRETCH_LEN * u;
+                    let p = inf.p - radial * distance;
+                    let lobe_w = w * mix(0.46, 0.10, u);
+                    g.push(Glow {
+                        p: rot(p),
+                        c: [head[0] * lobe_w, head[1] * lobe_w, head[2] * lobe_w],
+                        sig: mix(SUPER_SIG_ROOT, SUPER_SIG_TIP, u),
+                    });
+                }
+            }
         }
         // the trail: older parcels are dimmer and cooler
         let n = inf.tr.len().max(1);
@@ -1754,6 +1740,8 @@ struct ShCtx {
     c: f64,
     s: f64,
     ppc0: f64,
+    /// the parked-diorama mode keeps the background fixed as well
+    twinkle: bool,
 }
 
 /// Emission of one pixel at time `t` from cached geometry. This is all an
@@ -1776,10 +1764,11 @@ fn shade(g: &Geo, ctx: &ShCtx) -> [f64; 3] {
     }
     // tonemap(0) = 0, so pure-sky pixels skip the exponentials entirely
     let c = if g.n > 0 { tonemap(col) } else { [0.0; 3] };
+    let sky_t = if ctx.twinkle { ctx.t } else { 0.0 };
     let bg = match &g.sky {
         Some(cached) => {
             if ctx.orb == 0.0 {
-                sky_rgb(cached, ctx.t)
+                sky_rgb(cached, sky_t)
             } else {
                 // the star field does not rotate with the camera: look it up
                 // again at the rotated escape direction (cheap - the geodesics
@@ -1789,21 +1778,16 @@ fn shade(g: &Geo, ctx: &ShCtx) -> [f64; 3] {
                     g.esc.y,
                     g.esc.x * ctx.s + g.esc.z * ctx.c,
                 );
-                sky_rgb(&stars(d, ctx.ppc0), ctx.t)
+                sky_rgb(&stars(d, ctx.ppc0), sky_t)
             }
         }
         None => [0.0; 3],
     };
-    // the infalling star's glow: soft-clipped so it can blaze near the hole
-    // without flattening anything else, with a slow shimmer on top
+    // the infalling star's glow is steady; the funnel animation comes from
+    // moving parcels and changing mass, not an artificial brightness pulse
     let mut gl = [0.0f64; 3];
     if g.st != [0.0, 0.0, 0.0] {
-        let fl = 0.86 + 0.14 * tw_sin(8.0 * ctx.t);
-        gl = [
-            softclip(g.st[0] * fl),
-            softclip(g.st[1] * fl),
-            softclip(g.st[2] * fl),
-        ];
+        gl = [softclip(g.st[0]), softclip(g.st[1]), softclip(g.st[2])];
     }
     [
         (c[0] + bg[0] + gl[0]).clamp(0.0, 1.0),
@@ -1860,6 +1844,24 @@ impl Origin {
             Origin::Back => (w * -1.0, cam.r, cam.u),
         }
     }
+}
+
+/// Park the superstar according to `--origin`. With no origin keep the
+/// composed default position; for horizontal sides lift it just above the
+/// disk, while front/back get a small sideways offset so the donor does not
+/// sit exactly on the camera axis and flood the frame.
+fn super_park(origin: Option<Origin>, azi: f64, tilt: f64) -> V3 {
+    let Some(side) = origin else {
+        return SUPER_PARK;
+    };
+    let cam = Cam::new(azi, tilt.to_radians());
+    let (d, _, _) = side.basis(&cam);
+    let d = match side {
+        Origin::Left | Origin::Right => (d + V3::new(0.0, 0.08, 0.0)).norm(),
+        Origin::Top | Origin::Bottom => d,
+        Origin::Front | Origin::Back => (d + cam.r * 0.35 + V3::new(0.0, 0.04, 0.0)).norm(),
+    };
+    d * SUPER_PARK_R
 }
 
 struct Opt {
@@ -2449,6 +2451,7 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
         c: orbit.cos(),
         s: orbit.sin(),
         ppc0,
+        twinkle: !o.super_star,
     };
     // pixels that cannot change (no disk, no star, still camera) keep their
     // previous value; on the first frame or after a re-trace everything is
@@ -2888,7 +2891,7 @@ fn main() {
         let mut cache = GeoCache::new();
         let mut stars = Stars::new();
         if o.super_star {
-            stars.spawn_super();
+            stars.spawn_super(o.origin, o.azi, o.tilt);
             stars.advance(t);
         } else if o.big_star || o.star {
             stars.spawn(o.big_star, &o);
@@ -2920,7 +2923,7 @@ fn main() {
     let mut cache = GeoCache::new();
     let mut stars = Stars::new();
     if o.super_star {
-        stars.spawn_super();
+        stars.spawn_super(o.origin, o.azi, o.tilt);
     } else if o.big_star || o.star {
         stars.spawn(o.big_star, &o);
     }
@@ -3345,6 +3348,7 @@ mod tests {
             c: orb.cos(),
             s: orb.sin(),
             ppc0: 3.0,
+            twinkle: true,
         };
         let mut geo = Geo::empty();
         geo.sky = Some(stars(esc, ctx.ppc0));
@@ -3402,17 +3406,13 @@ mod tests {
         assert!(back.dot(toward_camera) < 0.0);
     }
 
-
-
-
     #[test]
     fn super_star_parks_and_bleeds_slowly_through_the_funnel() {
         let mut stars = Stars::new();
-        stars.spawn_super();
-        assert!(stars.feed);
+        stars.spawn_super(None, 0.0, CAM_TILT);
         assert_eq!(stars.live.len(), 1);
         // a second superstar never joins the first
-        stars.spawn_super();
+        stars.spawn_super(None, 0.0, CAM_TILT);
         assert_eq!(stars.live.len(), 1);
 
         // ten simulated minutes: the donor never moves an inch - the frame
@@ -3427,7 +3427,42 @@ mod tests {
         let flown: f64 = st.streams.iter().map(|s| s.w).sum();
         assert!(inf.m + flown <= 1.0 + 1e-9);
         assert!(1.0 - inf.m > flown, "some mass must already be swallowed");
-        assert!(!st.rem.is_empty(), "the hole should have drunk by now");
+    }
+
+    #[test]
+    fn super_star_origin_selects_the_parking_side() {
+        let cam = Cam::new(0.0, CAM_TILT.to_radians());
+        let left = super_park(Some(Origin::Left), 0.0, CAM_TILT);
+        let right = super_park(Some(Origin::Right), 0.0, CAM_TILT);
+        let top = super_park(Some(Origin::Top), 0.0, CAM_TILT);
+        let bottom = super_park(Some(Origin::Bottom), 0.0, CAM_TILT);
+        let front = super_park(Some(Origin::Front), 0.0, CAM_TILT);
+        let back = super_park(Some(Origin::Back), 0.0, CAM_TILT);
+
+        assert!(left.dot(cam.r) < 0.0 && right.dot(cam.r) > 0.0);
+        assert!(top.dot(cam.u) > 0.0 && bottom.dot(cam.u) < 0.0);
+        assert!(front.dot(cam.p.norm()) > 0.0 && back.dot(cam.p.norm()) < 0.0);
+        assert!((super_park(None, 0.0, CAM_TILT) - SUPER_PARK).len() < 1e-12);
+    }
+
+    #[test]
+    fn super_star_near_side_is_stretched_toward_the_hole() {
+        let mut stars = Stars::new();
+        stars.spawn_super(None, 0.0, CAM_TILT);
+        let glows = glow_list(&stars, 0.0);
+        assert_eq!(glows.len(), 1 + SUPER_STRETCH_N);
+
+        let radial = SUPER_PARK.norm();
+        let head_projection = glows[0].p.dot(radial);
+        let deepest_projection = glows
+            .iter()
+            .skip(1)
+            .map(|glow| glow.p.dot(radial))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            deepest_projection < head_projection - SUPER_STRETCH_LEN,
+            "near side was not elongated toward the hole"
+        );
     }
 
     #[test]
@@ -3465,41 +3500,6 @@ mod tests {
     }
 
     #[test]
-    fn swallowed_parcels_flash_only_while_feeding() {
-        let mk = || Stream {
-            p: V3::new(2.0, 0.0, 0.0),
-            v: V3::new(0.0, 0.0, 0.4),
-            w: 0.01,
-            age: 0.0,
-            life: 100.0,
-            drag: INFALL_DRAG,
-            bri: STREAM_BRI,
-            sig: STREAM_SIG,
-            fun: false,
-        };
-        // without the superstar there is no flicker
-        let mut plain = Stars::new();
-        plain.streams.push(mk());
-        plain.advance(5.0);
-        assert!(plain.rem.is_empty());
-        // with it, the swallowed parcel parks its flash by the photon sphere
-        let mut fed = Stars::new();
-        fed.feed = true;
-        fed.streams.push(mk());
-        fed.advance(0.5);
-        assert_eq!(fed.rem.len(), 1);
-        let rem = &fed.rem[0];
-        // planted at 750*w (7.5) at the moment of swallowing and fading
-        // exponentially since - so strictly between the just-planted value
-        // and a full 0.5 s of fade
-        let full_fade = 7.5 * (-0.5 / (INFALL_FADE * 0.35)).exp();
-        assert!(rem.b < 7.5 && rem.b > full_fade - 1e-9);
-        assert!((rem.sc - (600.0_f64 * 0.01).cbrt()).abs() < 1e-12);
-        assert!((rem.p.len() - 1.6).abs() < 1e-9);
-    }
-
-
-    #[test]
     fn speed_keys_step_multiplicatively_and_clamp() {
         assert!((step_speed(1.0, true) - SPEED_STEP).abs() < 1e-12);
         assert!((step_speed(1.0, false) - 1.0 / SPEED_STEP).abs() < 1e-12);
@@ -3519,12 +3519,11 @@ mod tests {
         assert_eq!(first_char(b"<"), '<');
         assert_eq!(first_char(b"."), '.');
         assert_eq!(first_char(b">"), '>');
+        // invalid UTF-8 falls back to the raw byte instead of garbage
         assert_eq!(first_char("\u{0431}".as_bytes()), '\u{0431}'); // б
         assert_eq!(first_char("\u{0411}".as_bytes()), '\u{0411}'); // Б
         assert_eq!(first_char("\u{044e}".as_bytes()), '\u{044e}'); // ю
         assert_eq!(first_char("\u{042e}".as_bytes()), '\u{042e}'); // Ю
-        // invalid UTF-8 falls back to the raw byte instead of garbage
         assert_eq!(first_char(&[0xff]), char::from(0xff_u8));
     }
-
 }
