@@ -527,6 +527,11 @@ const INFALL_FADE: f64 = 2.6;
 const INFALL_TRAIL_STEP: f64 = 1.1;
 /// trail length in points
 const INFALL_TRAIL_N: usize = 14;
+/// Shed material loses angular momentum and feels more drag than the intact
+/// star. That makes the old end of the trail spiral into the hole instead of
+/// remaining frozen along the orbit the head has already travelled.
+const INFALL_TRAIL_TANGENTIAL: f64 = 0.90;
+const INFALL_TRAIL_DRAG: f64 = 0.030;
 /// at most this many stars at once
 const INFALL_MAX: usize = 3;
 /// gaussian radii of head / trail point / remnant, in scene units
@@ -661,8 +666,7 @@ fn deposit_one(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut dyn FnMut(usi
                     let dx = gl.p.x - (px + sx * u);
                     let dy = gl.p.y - (py + sy * u);
                     let dz = gl.p.z - (pz + sz * u);
-                    let e =
-                        (-(dx * dx + dy * dy + dz * dz) / s2).exp() * s.dt as f64 * s.tr as f64;
+                    let e = (-(dx * dx + dy * dy + dz * dz) / s2).exp() * s.dt as f64 * s.tr as f64;
                     out(s.px as usize, [gl.c[0] * e, gl.c[1] * e, gl.c[2] * e]);
                 }
             }
@@ -670,54 +674,141 @@ fn deposit_one(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut dyn FnMut(usi
     }
 }
 
-/// Zero the deposited glow and lay the frame's glows over the cached
-/// geometry: parallel over the glows into per-thread buffers when asked,
-/// straight into the pixels otherwise.
+/// Per-worker glow accumulation. `px` is dense so updates need no hashing;
+/// `touched` makes clearing and reduction proportional to the number of lit
+/// pixels rather than the size of the entire ray grid.
+struct GlowBuf {
+    px: Vec<[f64; 3]>,
+    touched: Vec<u32>,
+}
+
+impl GlowBuf {
+    fn new() -> GlowBuf {
+        GlowBuf {
+            px: Vec::new(),
+            touched: Vec::new(),
+        }
+    }
+
+    fn resize(&mut self, len: usize) {
+        if self.px.len() != len {
+            self.px = vec![[0.0; 3]; len];
+            self.touched.clear();
+        }
+    }
+}
+
+struct GlowCache {
+    bufs: Vec<GlowBuf>,
+    lit: Vec<u32>,
+    grid_len: usize,
+}
+
+impl GlowCache {
+    fn new() -> GlowCache {
+        GlowCache {
+            bufs: Vec::new(),
+            lit: Vec::new(),
+            grid_len: 0,
+        }
+    }
+}
+
+/// Upper bound for all dense worker accumulators together. At very large ray
+/// grids deposition uses fewer workers instead of multiplying memory use by
+/// the machine's CPU count.
+const GLOW_BUF_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Lay the frame's glows over the cached geometry. Parallel workers retain
+/// their dense accumulation buffers between frames, but reduce and clear only
+/// pixels they actually touched. `lit` similarly identifies the Geo entries
+/// that need clearing at the beginning of the next glow frame.
 fn deposit_glows(
     segs: &[Seg],
     bin_off: &[u32],
     glows: &[Glow],
     geo: &mut [Geo],
+    cache: &mut GlowCache,
     par: bool,
     nthreads: usize,
 ) {
+    // This also runs on the first empty frame. Otherwise the final deposited
+    // trail remains in Geo forever after its glows disappear.
+    for px in cache.lit.drain(..) {
+        geo[px as usize].st = [0.0; 3];
+    }
     if glows.is_empty() || segs.is_empty() {
         return;
     }
-    for g in geo.iter_mut() {
-        g.st = [0.0; 3];
+    if cache.grid_len != geo.len() {
+        // A size change is an I-frame event, so release all old worker
+        // capacities once instead of letting several grid sizes accumulate.
+        cache.bufs.clear();
+        cache.grid_len = geo.len();
     }
-    let nt = if par { nthreads.min(glows.len()) } else { 1 };
+    let bytes_per_buf = geo
+        .len()
+        .saturating_mul(std::mem::size_of::<[f64; 3]>())
+        .max(1);
+    let memory_workers = (GLOW_BUF_BUDGET / bytes_per_buf).max(1);
+    let nt = if par {
+        nthreads.min(glows.len()).min(memory_workers)
+    } else {
+        1
+    };
     if nt <= 1 {
         for gl in glows {
             deposit_one(gl, segs, bin_off, &mut |px, add| {
                 let g = &mut geo[px];
+                if g.st == [0.0; 3] {
+                    cache.lit.push(px as u32);
+                }
                 g.st[0] += add[0];
                 g.st[1] += add[1];
                 g.st[2] += add[2];
             });
         }
     } else {
-        let mut bufs: Vec<Vec<[f64; 3]>> =
-            (0..nt).map(|_| vec![[0.0f64; 3]; geo.len()]).collect();
+        while cache.bufs.len() < nt {
+            cache.bufs.push(GlowBuf::new());
+        }
+        for buf in cache.bufs.iter_mut().take(nt) {
+            buf.resize(geo.len());
+        }
         std::thread::scope(|sc| {
-            for (chunk, buf) in glows.chunks(glows.len().div_ceil(nt)).zip(bufs.iter_mut()) {
+            for (chunk, buf) in glows
+                .chunks(glows.len().div_ceil(nt))
+                .zip(cache.bufs.iter_mut().take(nt))
+            {
                 sc.spawn(move || {
                     for gl in chunk {
                         deposit_one(gl, segs, bin_off, &mut |px, add| {
-                            buf[px][0] += add[0];
-                            buf[px][1] += add[1];
-                            buf[px][2] += add[2];
+                            let dst = &mut buf.px[px];
+                            if *dst == [0.0; 3] {
+                                buf.touched.push(px as u32);
+                            }
+                            dst[0] += add[0];
+                            dst[1] += add[1];
+                            dst[2] += add[2];
                         });
                     }
                 });
             }
         });
-        for buf in &bufs {
-            for (g, b) in geo.iter_mut().zip(buf.iter()) {
-                g.st[0] += b[0];
-                g.st[1] += b[1];
-                g.st[2] += b[2];
+        // Worker order matches glow-chunk order, exactly as in the previous
+        // full-buffer reduction. This preserves floating-point association.
+        for buf in cache.bufs.iter_mut().take(nt) {
+            for px in buf.touched.drain(..) {
+                let px = px as usize;
+                let add = buf.px[px];
+                buf.px[px] = [0.0; 3];
+                let g = &mut geo[px];
+                if g.st == [0.0; 3] {
+                    cache.lit.push(px as u32);
+                }
+                g.st[0] += add[0];
+                g.st[1] += add[1];
+                g.st[2] += add[2];
             }
         }
     }
@@ -737,13 +828,55 @@ fn tide(r: f64) -> f64 {
     1.0 + 9.0 * (RS / r) * (RS / r)
 }
 
+/// One parcel shed into a star's trail. Unlike a screen-space after-image it
+/// keeps moving under gravity, with reduced tangential speed and extra drag,
+/// until it crosses the horizon.
+struct Trail {
+    p: V3,
+    v: V3,
+}
+
+impl Trail {
+    fn shed(p: V3, v: V3) -> Trail {
+        let radial = p.norm();
+        let vr = radial * v.dot(radial);
+        let vt = v - vr;
+        Trail {
+            p,
+            v: vr + vt * INFALL_TRAIL_TANGENTIAL,
+        }
+    }
+
+    /// Advance one frame-sized slice, subdividing it near the horizon.
+    /// Returns false once this parcel has been swallowed.
+    fn advance(&mut self, mut dt: f64, gm: f64) -> bool {
+        while dt > 1e-9 {
+            let r = self.p.len();
+            let h = (if r < 3.0 { 0.004_f64 } else { 0.02_f64 }).min(dt);
+            self.v = self.v + Infall::acc(self.p, gm) * h;
+            self.v = self.v * (1.0 - INFALL_TRAIL_DRAG * h);
+            self.p = self.p + self.v * h;
+            dt -= h;
+            if self.p.len() <= INFALL_SWALLOW {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// A live star: position, velocity, the trail of where it has been and -
 /// for the massive one - how much mass it has left plus the bookkeeping
 /// for the streams it sheds on the way down.
 struct Infall {
     p: V3,
     v: V3,
-    tr: Vec<V3>,
+    tr: Vec<Trail>,
+    /// position of the head when the last trail parcel was shed
+    tr_at: V3,
+    /// false after the head crosses the horizon; the Infall remains until
+    /// its last trail parcel has followed it in
+    alive: bool,
     /// size scale: 3.0 for the massive star, else 1.0
     sc: f64,
     /// remaining mass fraction: the massive star is stripped inside its
@@ -761,7 +894,7 @@ impl Infall {
     /// `gm` is the hole's current pull (it fattens as it eats): the spawn
     /// speed must match it, or later stars spawn under-orbited and plunge
     /// straight into the hole without ever putting on a stripping show.
-    fn spawn(seed: i64, sc: f64, gm: f64) -> Infall {
+    fn spawn(seed: i64, sc: f64, gm: f64, d: V3, a: V3, b: V3, sf: Option<f64>) -> Infall {
         let rnd = |k: i64| hash3i(seed, k, 0x51A7);
         let (r0, f0, drag) = if sc > 1.5 {
             (BIG_R0, BIG_F0, BIG_DRAG)
@@ -769,19 +902,23 @@ impl Infall {
             (INFALL_R0, INFALL_F0, INFALL_DRAG)
         };
         let r = mix(r0.0, r0.1, rnd(1));
-        let phi = rnd(2) * std::f64::consts::TAU;
+        let cw = if rnd(2) < 0.5 { -1.0 } else { 1.0 };
         let inc = mix(INFALL_INC.0, INFALL_INC.1, rnd(3));
-        let f = mix(f0.0, f0.1, rnd(4));
+        // --star-speed overrides the draw: the fraction of the local
+        // circular speed the star starts at - 1 = a circular orbit,
+        // 0 = a dead drop, negative = the orbit run backwards
+        let f = sf.unwrap_or_else(|| mix(f0.0, f0.1, rnd(4)));
         // circular speed of the pseudo-potential at r, at the hole's
         // current (possibly fattened) strength
         let vc = (gm * r).sqrt() / (r - RS);
-        let p = V3::new(r * phi.cos(), 0.0, r * phi.sin());
-        let tang = V3::new(-phi.sin(), 0.0, phi.cos());
-        let v = tang * (f * vc * inc.cos()) + V3::new(0.0, 1.0, 0.0) * (f * vc * inc.sin());
+        let p = d * r;
+        let v = a * (f * vc * inc.cos() * cw) + b * (f * vc * inc.sin());
         Infall {
             p,
             v,
-            tr: vec![p],
+            tr: vec![Trail::shed(p, v)],
+            tr_at: p,
+            alive: true,
             sc,
             m: 1.0,
             drag,
@@ -798,46 +935,59 @@ impl Infall {
     /// Symplectic Euler with the step shrunk near the hole, plus this
     /// star's drag - a quarter of the usual for the massive one. Inside
     /// its tidal radius the massive star is torn apart: every 0.02 of
-    /// shed mass becomes a glowing stream particle. Returns false once
-    /// the star is inside the swallow radius.
+    /// shed mass becomes a glowing stream particle. After the head crosses
+    /// the horizon, keep advancing its trail until every parcel follows it.
     fn advance(&mut self, mut dt: f64, gm: f64, streams: &mut Vec<Stream>) -> bool {
         let rt = 0.9 * self.sc * (2.0f64 / 3.0).cbrt();
         while dt > 1e-9 {
-            let r = self.p.len() as f64;
-            let h = (if r < 3.0_f64 { 0.004_f64 } else { 0.02_f64 }).min(dt);
-            self.v = self.v + Self::acc(self.p, gm) * h;
-            self.v = self.v * (1.0 - self.drag * h);
-            self.p = self.p + self.v * h;
+            let r = self.p.len();
+            let h = (if self.alive && r < 3.0 {
+                0.004_f64
+            } else {
+                0.02_f64
+            })
+            .min(dt);
+
+            // Existing trail material advances over the same time slice as
+            // the head. Newly shed material is appended afterwards, at the
+            // end of the slice, so large --frame time jumps stay consistent.
+            self.tr.retain_mut(|q| q.advance(h, gm));
+
+            if self.alive {
+                self.v = self.v + Self::acc(self.p, gm) * h;
+                self.v = self.v * (1.0 - self.drag * h);
+                self.p = self.p + self.v * h;
+                if self.sc > 1.5 && r < rt {
+                    // inside the tidal radius the hole strips mass away
+                    let dm = self.m * INFALL_STRIP * ((rt / r) * (rt / r) * (rt / r) - 1.0) * h;
+                    self.m = (self.m - dm).max(0.05);
+                    self.debt += dm;
+                    while self.debt > 0.02 && streams.len() < STREAM_MAX {
+                        self.debt -= 0.02;
+                        self.ns += 1;
+                        streams.push(Stream {
+                            p: self.p,
+                            v: self.v * (0.95 + 0.10 * (self.ns % 4) as f64),
+                            w: 0.02,
+                            age: 0.0,
+                        });
+                    }
+                    self.debt = self.debt.min(0.02);
+                }
+                if (self.p - self.tr_at).len() > INFALL_TRAIL_STEP {
+                    self.tr.push(Trail::shed(self.p, self.v));
+                    self.tr_at = self.p;
+                    if self.tr.len() > INFALL_TRAIL_N {
+                        self.tr.remove(0);
+                    }
+                }
+                if self.p.len() <= INFALL_SWALLOW {
+                    self.alive = false;
+                }
+            }
             dt -= h;
-            if self.sc > 1.5 && r < rt {
-                // inside the tidal radius the hole strips mass away
-                let dm = self.m * INFALL_STRIP * ((rt / r) * (rt / r) * (rt / r) - 1.0) * h;
-                self.m = (self.m - dm).max(0.05);
-                self.debt += dm;
-                while self.debt > 0.02 && streams.len() < STREAM_MAX {
-                    self.debt -= 0.02;
-                    self.ns += 1;
-                    streams.push(Stream {
-                        p: self.p,
-                        v: self.v * (0.95 + 0.10 * (self.ns % 4) as f64),
-                        w: 0.02,
-                        age: 0.0,
-                    });
-                }
-                self.debt = self.debt.min(0.02);
-            }
-            let last = *self.tr.last().unwrap();
-            if (self.p - last).len() > INFALL_TRAIL_STEP {
-                self.tr.push(self.p);
-                if self.tr.len() > INFALL_TRAIL_N {
-                    self.tr.remove(0);
-                }
-            }
-            if self.p.len() <= INFALL_SWALLOW {
-                return false;
-            }
         }
-        true
+        self.alive || !self.tr.is_empty()
     }
 }
 
@@ -862,7 +1012,7 @@ impl Stream {
             return Some(0.0);
         }
         while dt > 1e-9 {
-            let r = self.p.len() as f64;
+            let r = self.p.len();
             let h = (if r < 3.0_f64 { 0.004_f64 } else { 0.02_f64 }).min(dt);
             self.v = self.v + Infall::acc(self.p, gm) * h;
             self.v = self.v * (1.0 - INFALL_DRAG * h);
@@ -902,14 +1052,39 @@ impl Stars {
         }
     }
 
-    fn spawn(&mut self, big: bool) {
-        if self.live.len() < INFALL_MAX {
+    fn spawn(&mut self, big: bool, o: &Opt) {
+        if self.live.iter().filter(|inf| inf.alive).count() < INFALL_MAX {
             self.seed += 1;
             // spawn at the hole's current pull so every star gets the
             // same show, not just the first one before it fattens
             let gm = INFALL_GM * (1.0 + self.m_acc);
-            self.live
-                .push(Infall::spawn(self.seed, if big { 3.0 } else { 1.0 }, gm));
+            // freeze the screen basis at spawn time so the star dives in
+            // from the side the user asked for; with no --origin every
+            // star picks a side at random, except the first one, which
+            // enters from the left
+            let cam = Cam::new(o.azi, o.tilt.to_radians());
+            let origin = o.origin.unwrap_or(if self.seed == 1 {
+                Origin::Left
+            } else {
+                match (hash3i(self.seed, 0xC0DE, 0x51A7) * 6.0) as usize {
+                    0 => Origin::Left,
+                    1 => Origin::Right,
+                    2 => Origin::Top,
+                    3 => Origin::Bottom,
+                    4 => Origin::Front,
+                    _ => Origin::Back,
+                }
+            });
+            let (d, a, b) = origin.basis(&cam);
+            self.live.push(Infall::spawn(
+                self.seed,
+                if big { 3.0 } else { 1.0 },
+                gm,
+                d,
+                a,
+                b,
+                o.star_speed,
+            ));
         }
     }
 
@@ -927,10 +1102,10 @@ impl Stars {
         let gm = INFALL_GM * (1.0 + self.m_acc);
         let mut i = 0;
         while i < self.live.len() {
-            if self.live[i].advance(dt, gm, &mut self.streams) {
-                i += 1;
-            } else {
-                let inf = self.live.remove(i);
+            let was_alive = self.live[i].alive;
+            let keep = self.live[i].advance(dt, gm, &mut self.streams);
+            if was_alive && !self.live[i].alive {
+                let inf = &self.live[i];
                 let r = inf.p.len();
                 let p = if r > 1e-9 {
                     inf.p * (1.6 / r)
@@ -938,6 +1113,11 @@ impl Stars {
                     V3::new(1.6, 0.0, 0.0)
                 };
                 self.rem = Some((p, 1.0, inf.sc * inf.m.cbrt()));
+            }
+            if keep {
+                i += 1;
+            } else {
+                self.live.remove(i);
             }
         }
         let mut i = 0;
@@ -969,21 +1149,23 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
     for inf in &st.live {
         // the glow tracks the star's size and whatever mass it has left
         let scl = inf.sc * inf.m.cbrt();
-        let head = heat(0.85);
-        let w = INFALL_HEAD_BRI * tide(inf.p.len()) * scl;
-        g.push(Glow {
-            p: rot(inf.p),
-            c: [head[0] * w, head[1] * w, head[2] * w],
-            sig: INFALL_SIG * scl,
-        });
-        // the trail: older points are dimmer and cooler
+        if inf.alive {
+            let head = heat(0.85);
+            let w = INFALL_HEAD_BRI * tide(inf.p.len()) * scl;
+            g.push(Glow {
+                p: rot(inf.p),
+                c: [head[0] * w, head[1] * w, head[2] * w],
+                sig: INFALL_SIG * scl,
+            });
+        }
+        // the trail: older parcels are dimmer and cooler
         let n = inf.tr.len().max(1);
         for (i, q) in inf.tr.iter().enumerate() {
             let u = i as f64 / n as f64; // 0 = oldest, 1 = newest
             let col = heat(0.25 + 0.5 * u);
-            let w = mix(0.25, 1.0, u) * INFALL_TRAIL_BRI * tide(q.len()) * scl;
+            let w = mix(0.25, 1.0, u) * INFALL_TRAIL_BRI * tide(q.p.len()) * scl;
             g.push(Glow {
-                p: rot(*q),
+                p: rot(q.p),
                 c: [col[0] * w, col[1] * w, col[2] * w],
                 sig: INFALL_TRAIL_SIG * scl,
             });
@@ -1081,6 +1263,9 @@ struct GeoCache {
     /// per-frame glow deposition scans these instead of re-integrating
     segs: Vec<Seg>,
     bin_off: Vec<u32>,
+    /// reusable per-worker glow accumulators and the Geo pixels lit in the
+    /// previous frame; both avoid full-grid work during sparse deposition
+    glow: GlowCache,
     /// whether the last frame had glows (the deposition must run once more
     /// to clear them after the star is gone)
     glow_was: bool,
@@ -1095,6 +1280,7 @@ impl GeoCache {
             mask: Vec::new(),
             segs: Vec::new(),
             bin_off: Vec::new(),
+            glow: GlowCache::new(),
             glow_was: false,
         }
     }
@@ -1329,6 +1515,34 @@ enum Mode {
     Sixel,
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum Origin {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    Front,
+    Back,
+}
+
+impl Origin {
+    /// Screen-frame basis at spawn time: `d` is the direction the star
+    /// dives in from, `a` the in-plane tangent and `b` the out-of-plane
+    /// lift - an orthonormal triple either way, so the orbit keeps its
+    /// shape no matter which side the star enters from.
+    fn basis(self, cam: &Cam) -> (V3, V3, V3) {
+        let w = cam.p.norm(); // toward the camera, out of the screen
+        match self {
+            Origin::Left => (cam.r * -1.0, cam.u, w),
+            Origin::Right => (cam.r, cam.u, w),
+            Origin::Top => (cam.u, cam.r, w),
+            Origin::Bottom => (cam.u * -1.0, cam.r, w),
+            Origin::Front => (w, cam.r, cam.u),
+            Origin::Back => (w * -1.0, cam.r, cam.u),
+        }
+    }
+}
+
 struct Opt {
     mode: Mode,
     fps: f64,
@@ -1354,6 +1568,12 @@ struct Opt {
     star: bool,
     /// start with a massive star, 3x the size of the hole
     big_star: bool,
+    /// which side of the screen the infalling star dives in from; None =
+    /// a random side per star (the first star enters from the left)
+    origin: Option<Origin>,
+    /// initial star speed as a fraction of the local circular speed;
+    /// negative runs the orbit backwards; None = the usual random draw
+    star_speed: Option<f64>,
     ramp: Vec<char>,
 }
 
@@ -1384,6 +1604,8 @@ fn parse_opt() -> Opt {
         one_shot: None,
         star: false,
         big_star: false,
+        origin: None,
+        star_speed: None,
         ramp: " .·:;+=*xX#%@█".chars().collect(),
     };
     let mut i = 0;
@@ -1404,6 +1626,23 @@ fn parse_opt() -> Opt {
                     }
                 }
             }
+            "--origin" => {
+                i += 1;
+                match args.get(i).map(|v| v.as_str()) {
+                    Some("left") => o.origin = Some(Origin::Left),
+                    Some("right") => o.origin = Some(Origin::Right),
+                    Some("top") => o.origin = Some(Origin::Top),
+                    Some("bottom") => o.origin = Some(Origin::Bottom),
+                    Some("front") => o.origin = Some(Origin::Front),
+                    Some("back") => o.origin = Some(Origin::Back),
+                    other => {
+                        eprintln!(
+                            "unknown origin: {other:?} (use left|right|top|bottom|front|back)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             "-h" | "--help" => {
                 print!("{HELP}");
                 std::process::exit(0);
@@ -1414,6 +1653,10 @@ fn parse_opt() -> Opt {
             "--orbit" => o.orbit = num(&args, &mut i),
             "--tilt" => o.tilt = num(&args, &mut i),
             "--shift" => o.shift = num(&args, &mut i),
+            "--star-speed" => {
+                let v = num(&args, &mut i);
+                o.star_speed = if v.is_nan() { None } else { Some(v) };
+            }
             "--cols" => o.cols = num(&args, &mut i) as usize,
             "--rows" => o.rows = num(&args, &mut i) as usize,
             "--rays" => o.rays = num(&args, &mut i).clamp(40_000.0, 4_000_000.0) as usize,
@@ -1491,6 +1734,11 @@ OPTIONS
       --no-color        no ANSI colours (pure ASCII output, good for pipes)
       --star            add a star that gets swallowed by the hole
       --big-star        start with a massive star, 3x the size of the hole
+      --origin <side>   side the star dives in from: left|right|top|bottom|front|back
+                        (default: random per star; the first star dives in from the left)
+      --star-speed <n>  initial star speed as a fraction of the local circular
+                        speed: 1 = circular orbit, 0 = dropped from rest,
+                        negative = the orbit run backwards (default: random)
 
 KEYS        q/Esc quit    +/- zoom    up/down tilt    left/right orbit rate    space pause
             s spawn star    S spawn big star    x clear stars
@@ -1702,9 +1950,9 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
     }
     let px = &mut f.px;
     let orbit = o.azi; // camera azimuth right now (kept by the caller)
-                                          // The camera may orbit, but the hole is axially symmetric: geometry is
-                                          // traced once at azimuth zero and shaded at the current azimuth (see
-                                          // `shade`), so an orbiting camera never pays for a re-trace.
+                       // The camera may orbit, but the hole is axially symmetric: geometry is
+                       // traced once at azimuth zero and shaded at the current azimuth (see
+                       // `shade`), so an orbiting camera never pays for a re-trace.
     let cam = Cam::new(0.0, o.tilt.to_radians());
     let zoom = o.zoom;
     let shift = o.shift;
@@ -1736,6 +1984,9 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
     if cache.key != key || cache.geo.len() != w * h {
         invalidated = true;
         cache.key = key;
+        // The re-trace overwrites every Geo entry, so old glow indices no
+        // longer identify state that needs an explicit clear.
+        cache.glow.lit.clear();
         // same reuse story as the pixel buffer: a stable-size re-trace (zoom)
         // overwrites every entry anyway
         if cache.geo.len() != w * h {
@@ -1814,6 +2065,7 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
             &cache.bin_off,
             glows,
             &mut cache.geo,
+            &mut cache.glow,
             par,
             nthreads,
         );
@@ -1839,8 +2091,7 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
     // previous value; on the first frame or after a re-trace everything is
     // shaded so the buffer is fully written. The mask carries the decision
     // so this pass streams 320 KB, not the whole geometry cache.
-    let skip_static =
-        !invalidated && !resized && orbit == 0.0 && !(glow_now || cache.glow_was);
+    let skip_static = !invalidated && !resized && orbit == 0.0 && !(glow_now || cache.glow_was);
     // glow-lit pixels are not in the trace-time mask, so while any glow is
     // live (and for one frame after the last one dies) everything is
     // re-shaded; once the residual is cleared the cheap masked path is
@@ -2274,7 +2525,7 @@ fn main() {
         let mut cache = GeoCache::new();
         let mut stars = Stars::new();
         if o.big_star || o.star {
-            stars.spawn(o.big_star);
+            stars.spawn(o.big_star, &o);
             stars.advance(t);
         }
         let glows = glow_list(&stars, o.azi);
@@ -2302,7 +2553,7 @@ fn main() {
     let mut cache = GeoCache::new();
     let mut stars = Stars::new();
     if o.big_star || o.star {
-        stars.spawn(o.big_star);
+        stars.spawn(o.big_star, &o);
     }
     let mut last = Instant::now();
     loop {
@@ -2363,11 +2614,11 @@ fn main() {
                 }
                 // drop another star into the well / clear the ones in flight
                 Key::Char('s') => {
-                    stars.spawn(false);
+                    stars.spawn(false, &o);
                     drawn = false;
                 }
                 Key::Char('S') => {
-                    stars.spawn(true);
+                    stars.spawn(true, &o);
                     drawn = false;
                 }
                 Key::Char('x') => {
@@ -2387,5 +2638,48 @@ fn draw_into(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
         Mode::Ascii => draw_ascii(o, f, out, scr),
         Mode::Braille => draw_braille(o, f, out, scr),
         Mode::Sixel => draw_sixel(o, f, out),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_glow_frame_clears_previous_deposition() {
+        let mut geo = vec![Geo::empty()];
+        geo[0].st = [1.0, 0.5, 0.25];
+        let mut cache = GlowCache::new();
+        cache.lit.push(0);
+
+        deposit_glows(&[], &[], &[], &mut geo, &mut cache, false, 1);
+
+        assert_eq!(geo[0].st, [0.0; 3]);
+        assert!(cache.lit.is_empty());
+    }
+
+    #[test]
+    fn shed_trail_loses_angular_momentum_and_falls_inward() {
+        let p = V3::new(10.0, 0.0, 0.0);
+        let circular = (INFALL_GM * p.len()).sqrt() / (p.len() - RS);
+        let mut trail = Trail::shed(p, V3::new(0.0, circular, 0.0));
+
+        assert!(trail.advance(2.0, INFALL_GM));
+        assert!(trail.p.len() < p.len());
+    }
+
+    #[test]
+    fn named_origins_match_screen_sides() {
+        let cam = Cam::new(0.0, 0.0);
+        let (left, _, _) = Origin::Left.basis(&cam);
+        let (right, _, _) = Origin::Right.basis(&cam);
+        let (front, _, _) = Origin::Front.basis(&cam);
+        let (back, _, _) = Origin::Back.basis(&cam);
+        let toward_camera = cam.p.norm();
+
+        assert!(left.dot(cam.r) < 0.0);
+        assert!(right.dot(cam.r) > 0.0);
+        assert!(front.dot(toward_camera) > 0.0);
+        assert!(back.dot(toward_camera) < 0.0);
     }
 }
