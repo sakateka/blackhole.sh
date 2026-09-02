@@ -638,7 +638,7 @@ const GLOW_R: f64 = BIG_R0.1 + 3.5 * INFALL_SIG * 3.0 + 0.06 * BIG_R0.1;
 
 /// One recorded trace segment inside the glow shell: the endpoints (start
 /// position and the step vector), the midpoint's radius for the cheap radial
-/// pre-reject, the integration step and the transmittance that was in effect
+/// pre-reject, the spatial length and the transmittance that was in effect
 /// when it was traced, and the pixel it belongs to. Storing these is what
 /// lets the glows move every frame without re-integrating the geodesics:
 /// the deposition just replays the gaussian sums over the bins it touches.
@@ -647,9 +647,67 @@ struct Seg {
     p0: [f32; 3],
     sg: [f32; 3],
     r: f32,
-    dt: f32,
+    dl: f32,
     tr: f32,
     px: u32,
+}
+
+const AXIAL_L_N: usize = 256;
+const AXIAL_C_N: usize = 512;
+const AXIAL_L_MAX: f64 = 6.0;
+const AXIAL_C_MAX: f64 = 6.0;
+static AXIAL_LUT: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+
+fn erf_approx(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let p = (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t
+        + 0.254_829_592)
+        * t;
+    sign * (1.0 - p * (-x * x).exp())
+}
+
+fn build_axial_lut() -> Vec<f32> {
+    let stride = AXIAL_C_N + 1;
+    let mut table = vec![0.0; (AXIAL_L_N + 1) * stride];
+    for li in 0..=AXIAL_L_N {
+        let l = li as f64 / AXIAL_L_N as f64 * AXIAL_L_MAX;
+        for ci in 0..=AXIAL_C_N {
+            let c = (ci as f64 / AXIAL_C_N as f64 * 2.0 - 1.0) * AXIAL_C_MAX;
+            let axial = (std::f64::consts::PI / 2.0).sqrt()
+                * (erf_approx((0.5 * l - c) / std::f64::consts::SQRT_2)
+                    + erf_approx((0.5 * l + c) / std::f64::consts::SQRT_2));
+            table[li * stride + ci] = axial as f32;
+        }
+    }
+    table
+}
+
+#[inline]
+fn axial_sample(table: &[f32], l: f64, c: f64) -> f64 {
+    if c.abs() >= AXIAL_C_MAX {
+        return 0.0;
+    }
+    let fl = (l * (AXIAL_L_N as f64 / AXIAL_L_MAX)).clamp(0.0, AXIAL_L_N as f64);
+    let fc = ((c / AXIAL_C_MAX + 1.0) * 0.5 * AXIAL_C_N as f64).clamp(0.0, AXIAL_C_N as f64);
+    let li = (fl.round() as usize).min(AXIAL_L_N);
+    let ci = (fc.round() as usize).min(AXIAL_C_N);
+    let stride = AXIAL_C_N + 1;
+    table[li * stride + ci] as f64
+}
+
+#[inline]
+fn segment_glow_weight(gl: &Glow, s: &Seg, axial_table: &[f32]) -> f64 {
+    let (px, py, pz) = (s.p0[0] as f64, s.p0[1] as f64, s.p0[2] as f64);
+    let (sx, sy, sz) = (s.sg[0] as f64, s.sg[1] as f64, s.sg[2] as f64);
+    let dl = s.dl as f64;
+    let (dx, dy, dz) = (gl.p.x - px, gl.p.y - py, gl.p.z - pz);
+    let along = (dx * sx + dy * sy + dz * sz) / dl;
+    let perp2 = (dx * dx + dy * dy + dz * dz - along * along).max(0.0);
+    let axial = axial_sample(axial_table, dl / gl.sig, (along - 0.5 * dl) / gl.sig);
+    let line = gl.sig * axial;
+    (-perp2 / (2.0 * gl.sig * gl.sig)).exp() * line * s.tr as f64
 }
 
 /// Uniform bins over the cube of side BIN_N * BIN_W centred on the hole -
@@ -700,17 +758,17 @@ fn build_bins(segs: &mut [Seg], bin_off: &mut Vec<u32>) {
 }
 
 /// Add one glow's light to `out`, indexed by pixel. This is the same sum the
-/// trace used to carry inline - radial pre-reject, closest approach of the
-/// segment, gaussian weight times step times transmittance - but only over
+/// trace used to carry inline - radial pre-reject and the gaussian line
+/// integral with transmittance - but only over
 /// the bins within the glow's reach, a few thousand segments instead of
 /// every segment tested against every glow.
 fn deposit_one(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut dyn FnMut(usize, [f64; 3])) {
+    let axial_table = AXIAL_LUT.get_or_init(build_axial_lut);
     let gr = gl.p.len();
     let rej = gl.sig * 3.5 + 0.06 * gr;
     let range = (rej / BIN_W).ceil() as isize + 1;
     let cell = |v: f64| (((v / BIN_W).floor() as isize) + BIN_C).clamp(0, BIN_N as isize - 1);
     let (gx, gy, gz) = (cell(gl.p.x), cell(gl.p.y), cell(gl.p.z));
-    let s2 = 2.0 * gl.sig * gl.sig;
     let last = BIN_N as isize - 1;
     for z in (gz - range).max(0)..=(gz + range).min(last) {
         for y in (gy - range).max(0)..=(gy + range).min(last) {
@@ -722,15 +780,7 @@ fn deposit_one(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut dyn FnMut(usi
                     if (s.r as f64 - gr).abs() > rej + 1e-4 {
                         continue;
                     }
-                    // closest approach of the segment to the glow
-                    let (px, py, pz) = (s.p0[0] as f64, s.p0[1] as f64, s.p0[2] as f64);
-                    let (sx, sy, sz) = (s.sg[0] as f64, s.sg[1] as f64, s.sg[2] as f64);
-                    let du = (gl.p.x - px) * sx + (gl.p.y - py) * sy + (gl.p.z - pz) * sz;
-                    let u = (du / (sx * sx + sy * sy + sz * sz)).clamp(0.0, 1.0);
-                    let dx = gl.p.x - (px + sx * u);
-                    let dy = gl.p.y - (py + sy * u);
-                    let dz = gl.p.z - (pz + sz * u);
-                    let e = (-(dx * dx + dy * dy + dz * dz) / s2).exp() * s.dt as f64 * s.tr as f64;
+                    let e = segment_glow_weight(gl, s, axial_table);
                     out(s.px as usize, [gl.c[0] * e, gl.c[1] * e, gl.c[2] * e]);
                 }
             }
@@ -1352,6 +1402,26 @@ impl GeoCache {
     }
 }
 
+#[inline]
+fn record_glow_segment(p0: V3, p1: V3, tr: f64, px: usize, segs: &mut Vec<Seg>) {
+    let sg = p1 - p0;
+    let dl = sg.len();
+    if dl <= 1e-12 {
+        return;
+    }
+    let rm = (p0 + sg * 0.5).len();
+    if rm < GLOW_R {
+        segs.push(Seg {
+            p0: [p0.x as f32, p0.y as f32, p0.z as f32],
+            sg: [sg.x as f32, sg.y as f32, sg.z as f32],
+            r: rm as f32,
+            dl: dl as f32,
+            tr: tr as f32,
+            px: px as u32,
+        });
+    }
+}
+
 /// Integrate one ray backwards from the camera and record what the shading
 /// will need later. Time-independent by construction; `ppc0` is the ray-grid
 /// pitch in pixels per star cell, needed to size the star cores. Segments
@@ -1413,23 +1483,8 @@ fn trace_geo(
         let an = accel(pn, h2);
         let vn = v + (a + an) * (0.5 * dt);
 
-        // the infalling star's glows are deposited after the trace, from a
-        // compact record of every segment that threads the glow shell:
-        // endpoints, step and the transmittance in effect here
-        let seg = pn - p;
-        let rm = (p + seg * 0.5).len();
-        if rm < GLOW_R {
-            segs.push(Seg {
-                p0: [p.x as f32, p.y as f32, p.z as f32],
-                sg: [seg.x as f32, seg.y as f32, seg.z as f32],
-                r: rm as f32,
-                dt: dt as f32,
-                tr: tr as f32,
-                px: px as u32,
-            });
-        }
-
         // did we cross the equatorial plane?
+        let mut disk_hit = None;
         if p.y * pn.y < 0.0 {
             let k = p.y / (p.y - pn.y);
             let hp = p + (pn - p) * k;
@@ -1462,8 +1517,17 @@ fn trace_geo(
                     };
                     n += 1;
                 }
-                tr *= DISK_OPA;
+                disk_hit = Some(hp);
             }
+        }
+        // Cache the spatial line element for moving glows. A disk crossing
+        // splits it so light on the far side receives the post-disk opacity.
+        if let Some(hp) = disk_hit {
+            record_glow_segment(p, hp, tr, px, segs);
+            tr *= DISK_OPA;
+            record_glow_segment(hp, pn, tr, px, segs);
+        } else {
+            record_glow_segment(p, pn, tr, px, segs);
         }
         p = pn;
         v = vn;
@@ -2767,6 +2831,70 @@ mod tests {
 
         assert_eq!(geo[0].st, [0.0; 3]);
         assert!(cache.lit.is_empty());
+    }
+
+    #[test]
+    fn gaussian_segment_integral_matches_numerical_quadrature() {
+        let p0 = V3::new(-0.8, 0.2, -0.1);
+        let p1 = V3::new(1.1, -0.3, 0.4);
+        let sg = p1 - p0;
+        let seg = Seg {
+            p0: [p0.x as f32, p0.y as f32, p0.z as f32],
+            sg: [sg.x as f32, sg.y as f32, sg.z as f32],
+            r: 0.0,
+            dl: sg.len() as f32,
+            tr: 0.37,
+            px: 0,
+        };
+        let glow = Glow {
+            p: V3::new(0.15, 0.45, 0.2),
+            c: [1.0; 3],
+            sig: 0.38,
+        };
+        let n = 20_000;
+        let mut numerical = 0.0;
+        for i in 0..n {
+            let u = (i as f64 + 0.5) / n as f64;
+            let d = p0 + sg * u - glow.p;
+            numerical += (-d.len2() / (2.0 * glow.sig * glow.sig)).exp();
+        }
+        numerical *= sg.len() / n as f64 * seg.tr as f64;
+
+        let analytic = segment_glow_weight(&glow, &seg, AXIAL_LUT.get_or_init(build_axial_lut));
+        let error = (analytic - numerical).abs();
+        assert!(
+            error < 1e-4,
+            "integral error: {error}, analytic={analytic}, numerical={numerical}"
+        );
+    }
+
+    #[test]
+    fn disk_crossing_splits_glow_transmittance() {
+        let cam = Cam::new(0.0, 12.0_f64.to_radians());
+        let target = V3::new(0.0, 0.0, 5.0);
+        let mut geo = Geo::empty();
+        let mut segs = Vec::new();
+        trace_geo(
+            &cam,
+            (target - cam.p).norm(),
+            3.0,
+            10.0,
+            &mut geo,
+            0,
+            &mut segs,
+        );
+
+        let split = segs.windows(2).any(|pair| {
+            let a = &pair[0];
+            let b = &pair[1];
+            let ay = a.p0[1] as f64 + a.sg[1] as f64;
+            ay.abs() < 1e-5
+                && (b.p0[1] as f64).abs() < 1e-5
+                && (b.tr as f64 - a.tr as f64 * DISK_OPA).abs() < 1e-6
+        });
+
+        assert!(geo.n > 0);
+        assert!(split);
     }
 
     #[test]
