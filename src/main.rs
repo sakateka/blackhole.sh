@@ -2023,6 +2023,8 @@ OPTIONS
                         negative = the orbit run backwards (default: random)
 
 KEYS        q/Esc quit    +/- zoom    up/down tilt    left/right orbit rate    space pause
+            < / > simulation speed slower/faster (same physical keys in any
+            keyboard layout)
             s spawn star    S spawn big star    x clear stars
 ";
 
@@ -2156,6 +2158,40 @@ const TILT_LIMIT: f64 = 80.0;
 const ORBIT_STEP: f64 = 1.0;
 const ORBIT_MAX: f64 = 90.0;
 
+/// Simulation-speed multiplier per < / > press and the range it is clamped
+/// to (held keys auto-repeat here too, exactly like the zoom and tilt keys).
+const SPEED_STEP: f64 = 1.15;
+const SPEED_MIN: f64 = 1.0 / 64.0;
+const SPEED_MAX: f64 = 128.0;
+
+/// One press of the speed keys: multiplicative like the zoom keys, clamped
+/// to the range above, and preserving the direction of a negative
+/// `--speed -n` (time running backwards) instead of flipping it.
+fn step_speed(speed: f64, up: bool) -> f64 {
+    let s = if up {
+        (speed.abs() * SPEED_STEP).min(SPEED_MAX)
+    } else {
+        (speed.abs() / SPEED_STEP).max(SPEED_MIN)
+    };
+    if speed < 0.0 {
+        -s
+    } else {
+        s
+    }
+}
+
+/// The first UTF-8 character of a keypress, or the raw byte as a fallback
+/// for anything that is not valid UTF-8. A terminal in a non-Latin layout
+/// sends multi-byte characters for the very physical keys whose ASCII a
+/// Latin layout would produce, so decoding properly (instead of taking the
+/// first byte) is what lets a binding follow the key, not the layout.
+fn first_char(b: &[u8]) -> char {
+    std::str::from_utf8(b)
+        .ok()
+        .and_then(|s| s.chars().next())
+        .unwrap_or_else(|| b[0] as char)
+}
+
 /// Poll stdin for one key. Arrow keys arrive as 3-byte bursts (`ESC [ A`, or
 /// `ESC O A` in application cursor mode); a lone ESC is either the Esc key
 /// or a burst that came in fragmented, so give the terminal a few
@@ -2174,7 +2210,7 @@ fn poll_key() -> Option<Key> {
         Ok(n) => n,
     };
     if b[0] != 0x1b {
-        return Some(Key::Char(b[0] as char));
+        return Some(Key::Char(first_char(&b[..n])));
     }
     if n >= 3 && (b[1] == b'[' || b[1] == b'O') {
         return seq(b[2]);
@@ -2880,6 +2916,17 @@ fn main() {
                     o.zoom = (o.zoom / 1.15).clamp(0.25, 6.0);
                     drawn = false;
                 }
+                // simulation speed: < slower, > faster. Terminals report
+                // whatever the current layout puts on the key, so match the
+                // unshifted latin , / . and the cyrillic letters living on
+                // the same physical keys (б / ю, shifted Б / Ю) - neither
+                // shift state nor layout changes the binding
+                Key::Char('<') | Key::Char(',') | Key::Char('б') | Key::Char('Б') => {
+                    o.speed = step_speed(o.speed, false);
+                }
+                Key::Char('>') | Key::Char('.') | Key::Char('ю') | Key::Char('Ю') => {
+                    o.speed = step_speed(o.speed, true);
+                }
                 // tilt the camera over/under the disk plane; tilt is part of
                 // the geometry cache key, so the next frame re-traces
                 Key::Up => {
@@ -3424,4 +3471,32 @@ mod tests {
         assert!((rem.p.len() - 1.6).abs() < 1e-9);
     }
 
+
+    #[test]
+    fn speed_keys_step_multiplicatively_and_clamp() {
+        assert!((step_speed(1.0, true) - SPEED_STEP).abs() < 1e-12);
+        assert!((step_speed(1.0, false) - 1.0 / SPEED_STEP).abs() < 1e-12);
+        assert_eq!(step_speed(1000.0, true), SPEED_MAX);
+        assert_eq!(step_speed(1e-9, false), SPEED_MIN);
+        // a backwards-running simulation stays backwards
+        assert!((step_speed(-2.0, true) + 2.0 * SPEED_STEP).abs() < 1e-12);
+        assert!(step_speed(-0.5, false) < 0.0);
+    }
+
+    #[test]
+    fn speed_keys_follow_the_physical_key_in_any_layout() {
+        // a latin layout sends , / . (shifted: < / >); a russian layout sends
+        // the cyrillic letters living on the same physical keys as two-byte
+        // UTF-8 - first_char must yield the character, not the first byte
+        assert_eq!(first_char(b","), ',');
+        assert_eq!(first_char(b"<"), '<');
+        assert_eq!(first_char(b"."), '.');
+        assert_eq!(first_char(b">"), '>');
+        assert_eq!(first_char("\u{0431}".as_bytes()), '\u{0431}'); // б
+        assert_eq!(first_char("\u{0411}".as_bytes()), '\u{0411}'); // Б
+        assert_eq!(first_char("\u{044e}".as_bytes()), '\u{044e}'); // ю
+        assert_eq!(first_char("\u{042e}".as_bytes()), '\u{042e}'); // Ю
+        // invalid UTF-8 falls back to the raw byte instead of garbage
+        assert_eq!(first_char(&[0xff]), char::from(0xff_u8));
+    }
 }
