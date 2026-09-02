@@ -132,7 +132,7 @@ struct V3 {
 }
 
 impl V3 {
-    fn new(x: f64, y: f64, z: f64) -> V3 {
+    const fn new(x: f64, y: f64, z: f64) -> V3 {
         V3 { x, y, z }
     }
     fn dot(self, o: V3) -> f64 {
@@ -610,34 +610,45 @@ const INFALL_REM_BRI: f64 = 10.0;
 const BIG_R0: (f64, f64) = (24.0, 33.0);
 const BIG_F0: (f64, f64) = (0.58, 0.70);
 const BIG_DRAG: f64 = INFALL_DRAG * 0.25;
-/// the superstar: a puffy giant several times the massive star's size, on
-/// a wide near-circular orbit that barely decays. Its tenuous envelope
-/// bleeds through the inner Lagrange point the whole time - one glowing
-/// parcel at a time, each on its own long arc into the hole - so the
-/// transfer plays out over tens of minutes instead of one quick shred.
+/// the superstar: a parked giant several times the massive star's size,
+/// held dead-still in the world frame while its envelope pours into the
+/// hole through one long funnel. Every parcel is launched from the same
+/// spot the same way, so they all trace the same arc and the stream reads
+/// as a single coherent vortex - wide where it leaves the donor, a thin
+/// spout by the time it pours past the horizon - instead of a dispersing
+/// cloud. The frame never rotates: only the flow inside the funnel moves,
+/// and the drain plays out over tens of minutes.
 const SUPER_SC: f64 = 6.0;
-const SUPER_R0: (f64, f64) = (24.0, 30.0);
-const SUPER_F0: (f64, f64) = (0.90, 0.97);
-const SUPER_DRAG: f64 = INFALL_DRAG * 0.08;
-/// envelope mass bled into the transfer stream per second: at this rate
-/// the star still keeps most of itself after ten minutes of watching
+/// where the donor sits (world frame): on the far side of the hole and
+/// well off to the side of the view axis, so its glow stays a compact
+/// blob at the frame's edge while the funnel sweeps across the picture
+const SUPER_PARK: V3 = V3::new(-17.1, 2.0, -19.2);
+/// |SUPER_PARK|, spelled out for the funnel's width taper
+const SUPER_PARK_R: f64 = 25.8;
+/// envelope mass bled into the funnel per second: at this rate the star
+/// still keeps most of itself after ten minutes of watching
 const SUPER_SHED_RATE: f64 = 0.00045;
 /// mass (and glow weight) of one shed parcel, and how many may be in
-/// flight at once - the chain of parcels strung along the arc is the
-/// visible bridge between the two
-const SUPER_SHED_W: f64 = 0.00315;
+/// flight at once - a parcel every ~0.9 s strung along the arc is what
+/// makes the funnel read as continuous
+const SUPER_SHED_W: f64 = 0.0004;
 const SUPER_STREAM_MAX: usize = 160;
+/// how the funnel leaves the donor: mostly tangential (perpendicular to
+/// the star-hole line), a touch toward the hole - enough sideways speed
+/// to swing a long arc around, little enough to keep diving inward
+const SUPER_FUN_F: f64 = 0.90;
+const SUPER_FUN_G: f64 = 0.10;
 /// the bleed is diffuse shock-heated gas rather than a compact clump: it
-/// couples to the field only weakly (a shade of the star's own drag, so
-/// each parcel spirals in over minutes, not seconds) and shines far
-/// brighter per unit mass, which is the only way a deliberately slow
-/// drain stays visible at all
-const SUPER_STREAM_DRAG: f64 = INFALL_DRAG * 0.25;
-const SUPER_STREAM_BRI: f64 = 90.0;
-const SUPER_STREAM_LIFE: f64 = 900.0;
-/// and it is a fat diffuse thing, not a compact clump - a thicker gaussian
-/// so the chain of parcels reads as a filament rather than a dotted line
-const SUPER_STREAM_SIG: f64 = 0.62;
+/// couples to the field (drag shrinks the arc wrap by wrap until it
+/// pours past the horizon) and shines far brighter per unit mass, which
+/// is the only way a deliberately slow drain stays visible at all
+const SUPER_STREAM_DRAG: f64 = 0.010;
+const SUPER_STREAM_BRI: f64 = 220.0;
+const SUPER_STREAM_LIFE: f64 = 300.0;
+/// the funnel's gaussian radius at the spout (by the hole) and at the
+/// throat (by the star)
+const SUPER_SIG_TIP: f64 = 0.5;
+const SUPER_SIG_ROOT: f64 = 1.25;
 /// how fast the massive star is torn apart inside its tidal radius
 const INFALL_STRIP: f64 = 2.5;
 /// how long a shed stream particle keeps glowing
@@ -1044,15 +1055,17 @@ struct Infall {
     /// streams shed so far, and the mass shed since the last one
     ns: u64,
     debt: f64,
+    /// the superstar is parked: held at a fixed position so the frame
+    /// never moves, and only its funnel flows. No orbital integration,
+    /// no trail, no horizon crossing - just the bleed.
+    parked: bool,
 }
 
 impl Infall {
     /// Deterministic spawn from a seed, so `--star` always looks the same.
     fn spawn(seed: i64, sc: f64, d: V3, a: V3, b: V3, sf: Option<f64>) -> Infall {
         let rnd = |k: i64| hash3i(seed, k, 0x51A7);
-        let (r0, f0, drag) = if sc > 5.5 {
-            (SUPER_R0, SUPER_F0, SUPER_DRAG)
-        } else if sc > 1.5 {
+        let (r0, f0, drag) = if sc > 1.5 {
             (BIG_R0, BIG_F0, BIG_DRAG)
         } else {
             (INFALL_R0, INFALL_F0, INFALL_DRAG)
@@ -1079,6 +1092,7 @@ impl Infall {
             drag,
             ns: 0,
             debt: 0.0,
+            parked: false,
         }
     }
 
@@ -1108,7 +1122,7 @@ impl Infall {
             // end of the slice, so large --frame time jumps stay consistent.
             self.tr.retain_mut(|q| q.advance(h, gm));
 
-            if self.alive {
+            if self.alive && !self.parked {
                 self.v = self.v + Self::acc(self.p, gm) * h;
                 self.v = self.v * (1.0 - self.drag * h);
                 self.p = self.p + self.v * h;
@@ -1120,61 +1134,6 @@ impl Infall {
                     self.debt += self.m - next_mass;
                     self.m = next_mass;
                 }
-                if self.sc > 5.5 {
-                    // Roche-lobe overflow: far outside the tidal radius the
-                    // tenuous envelope already bleeds through the inner
-                    // Lagrange point - slowly, so the transfer lasts
-                    let bleed = SUPER_SHED_RATE * h;
-                    let next_mass = (self.m - bleed).max(0.05);
-                    self.debt += self.m - next_mass;
-                    self.m = next_mass;
-                }
-                if self.sc > 1.5 {
-                    let (w0, cap, l1) = if self.sc > 5.5 {
-                        (SUPER_SHED_W, SUPER_STREAM_MAX, true)
-                    } else {
-                        (0.02, STREAM_MAX, false)
-                    };
-                    // Keep unmaterialized shed mass in `debt` while the visual
-                    // particle pool is full; never create or discard mass just
-                    // because the pool was reached.
-                    while self.debt > w0 && streams.len() < cap {
-                        self.debt -= w0;
-                        self.ns += 1;
-                        // the overflow leaves through L1: a touch slower than
-                        // the star itself and nudged toward the hole, so each
-                        // parcel finds its own decaying arc
-                        let v = if l1 {
-                            let rad = self.p.norm();
-                            self.v * (0.80 + 0.06 * (self.ns % 5) as f64)
-                                + rad * (-0.10 * self.v.len())
-                        } else {
-                            self.v * (0.95 + 0.10 * (self.ns % 4) as f64)
-                        };
-                        streams.push(Stream {
-                            p: if l1 {
-                                self.p * (1.0 - 0.02)
-                            } else {
-                                self.p
-                            },
-                            v,
-                            w: w0,
-                            age: 0.0,
-                            life: if l1 {
-                                SUPER_STREAM_LIFE
-                            } else {
-                                STREAM_LIFE
-                            },
-                            drag: if l1 {
-                                SUPER_STREAM_DRAG
-                            } else {
-                                INFALL_DRAG
-                            },
-                            bri: if l1 { SUPER_STREAM_BRI } else { STREAM_BRI },
-                            sig: if l1 { SUPER_STREAM_SIG } else { STREAM_SIG },
-                        });
-                    }
-                }
                 if (self.p - self.tr_at).len() > INFALL_TRAIL_STEP {
                     self.tr.push(Trail::shed(self.p, self.v));
                     self.tr_at = self.p;
@@ -1184,6 +1143,66 @@ impl Infall {
                 }
                 if self.p.len() <= INFALL_SWALLOW {
                     self.alive = false;
+                }
+            }
+            if self.alive && self.sc > 5.5 {
+                // Roche-lobe overflow: the parked donor's envelope bleeds
+                // into the funnel - slowly, so the transfer lasts
+                let bleed = SUPER_SHED_RATE * h;
+                let next_mass = (self.m - bleed).max(0.05);
+                self.debt += self.m - next_mass;
+                self.m = next_mass;
+            }
+            if self.alive && self.sc > 1.5 {
+                let (w0, cap, fun) = if self.sc > 5.5 {
+                    (SUPER_SHED_W, SUPER_STREAM_MAX, true)
+                } else {
+                    (0.02, STREAM_MAX, false)
+                };
+                // Keep unmaterialized shed mass in `debt` while the visual
+                // particle pool is full; never create or discard mass just
+                // because the pool was reached.
+                while self.debt > w0 && streams.len() < cap {
+                    self.debt -= w0;
+                    self.ns += 1;
+                    // the funnel leaves the donor through L1: mostly
+                    // tangential, nudged toward the hole, with a few per
+                    // cent of jitter so the ribbon breathes. Identical
+                    // launches make identical arcs - one coherent funnel
+                    // instead of a dispersing cloud
+                    let v = if fun {
+                        let r = self.p.len();
+                        let vc = (INFALL_GM * r).sqrt() / (r - RS);
+                        let rad = self.p.norm();
+                        let tan = V3::new(0.0, 1.0, 0.0).cross(rad).norm();
+                        let k = (self.ns % 3) as f64 - 1.0;
+                        tan * (SUPER_FUN_F * vc * (1.0 + 0.05 * k)) - rad * (SUPER_FUN_G * vc)
+                    } else {
+                        self.v * (0.95 + 0.10 * (self.ns % 4) as f64)
+                    };
+                    streams.push(Stream {
+                        p: if fun {
+                            self.p * (1.0 - 0.02)
+                        } else {
+                            self.p
+                        },
+                        v,
+                        w: w0,
+                        age: 0.0,
+                        life: if fun {
+                            SUPER_STREAM_LIFE
+                        } else {
+                            STREAM_LIFE
+                        },
+                        drag: if fun {
+                            SUPER_STREAM_DRAG
+                        } else {
+                            INFALL_DRAG
+                        },
+                        bri: if fun { SUPER_STREAM_BRI } else { STREAM_BRI },
+                        sig: STREAM_SIG,
+                        fun,
+                    });
                 }
             }
             dt -= h;
@@ -1200,14 +1219,16 @@ struct Stream {
     p: V3,
     v: V3,
     /// how much star mass it carries; `bri` is how brightly that mass
-    /// shines - far above STREAM_BRI for the shock-heated superstar bleed -
-    /// and `sig` how wide the glow spreads
+    /// shines - far above STREAM_BRI for the shock-heated funnel - `sig`
+    /// its glow radius, and `fun` marks a funnel parcel (whose radius
+    /// tapers toward the spout instead)
     w: f64,
     age: f64,
     life: f64,
     drag: f64,
     bri: f64,
     sig: f64,
+    fun: bool,
 }
 
 impl Stream {
@@ -1304,16 +1325,28 @@ impl Stars {
         }
     }
 
-    /// The superstar is meant to be the whole show, so only one of it at
-    /// a time; unlike the others it drains into the hole over tens of
-    /// minutes instead of ending in one shred.
-    fn spawn_super(&mut self, o: &Opt) {
+    /// The superstar is meant to be the whole show, and the show is a
+    /// diorama: the donor is parked at a fixed spot in the world frame,
+    /// so the frame never moves - only the funnel between it and the hole
+    /// does. One at a time.
+    fn spawn_super(&mut self) {
         if self.live.iter().any(|inf| inf.sc > 5.5) {
             return;
         }
-        let (d, a, b) = self.origin_basis(o);
-        self.live
-            .push(Infall::spawn(self.seed, SUPER_SC, d, a, b, o.star_speed));
+        let p = SUPER_PARK;
+        self.live.push(Infall {
+            p,
+            v: V3::new(0.0, 0.0, 0.0),
+            tr: Vec::new(),
+            tr_at: p,
+            alive: true,
+            sc: SUPER_SC,
+            m: 1.0,
+            drag: 0.0,
+            ns: 0,
+            debt: 0.0,
+            parked: true,
+        });
         self.feed = true;
     }
 
@@ -1352,8 +1385,8 @@ impl Stars {
                     };
                     self.rem.push(Remnant {
                         p,
-                        b: 40.0 * stream.w,
-                        sc: (60.0 * stream.w).cbrt(),
+                        b: 750.0 * stream.w,
+                        sc: (600.0 * stream.w).cbrt(),
                     });
                 }
                 false
@@ -1410,7 +1443,7 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
         // segments (GLOW_R) that the binned deposition scans
         let scl = inf.sc * inf.m.cbrt();
         let vis = scl.min(4.5);
-        let sig_scl = scl.min(3.0);
+        let sig_scl = scl.min(2.2);
         if inf.alive {
             let head = heat(0.85);
             let w = INFALL_HEAD_BRI * tide(inf.p.len()) * vis;
@@ -1438,10 +1471,21 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
     for stm in &st.streams {
         let b = 1.0 - stm.age / stm.life;
         let w = stm.bri * stm.w * b * tide(stm.p.len());
+        // the funnel is a fat tongue where it leaves the donor and a thin
+        // spout by the time it pours into the hole
+        let sig = if stm.fun {
+            mix(
+                SUPER_SIG_TIP,
+                SUPER_SIG_ROOT,
+                (stm.p.len() / SUPER_PARK_R).min(1.0),
+            )
+        } else {
+            stm.sig
+        };
         g.push(Glow {
             p: rot(stm.p),
             c: [w, 0.75 * w, 0.45 * w],
-            sig: stm.sig,
+            sig,
         });
     }
     for rem in &st.rem {
@@ -2013,9 +2057,10 @@ OPTIONS
       --no-color        no ANSI colours (pure ASCII output, good for pipes)
       --star            add a star that gets swallowed by the hole
       --big-star        start with a massive star, 3x the size of the hole
-      --super-star     start with a superstar: a giant on a wide orbit bleeding a
-                        luminous stream into the hole, parcel by parcel, for a
-                        very long time (s/S still add normal stars on top)
+      --super-star     start with a superstar: a giant parked dead-still in the
+                        frame, pouring one long luminous funnel into the hole -
+                        the frame never rotates, only the flow moves, and the
+                        drain takes tens of minutes (s/S add normal stars)
       --origin <side>   side the star dives in from: left|right|top|bottom|front|back
                         (default: random per star; the first star dives in from the left)
       --star-speed <n>  initial star speed as a fraction of the local circular
@@ -2843,7 +2888,7 @@ fn main() {
         let mut cache = GeoCache::new();
         let mut stars = Stars::new();
         if o.super_star {
-            stars.spawn_super(&o);
+            stars.spawn_super();
             stars.advance(t);
         } else if o.big_star || o.star {
             stars.spawn(o.big_star, &o);
@@ -2875,7 +2920,7 @@ fn main() {
     let mut cache = GeoCache::new();
     let mut stars = Stars::new();
     if o.super_star {
-        stars.spawn_super(&o);
+        stars.spawn_super();
     } else if o.big_star || o.star {
         stars.spawn(o.big_star, &o);
     }
@@ -3020,6 +3065,7 @@ mod tests {
             drag: BIG_DRAG,
             ns: 0,
             debt: 0.0,
+            parked: false,
         });
         stars
     }
@@ -3215,6 +3261,7 @@ mod tests {
             drag: INFALL_DRAG,
             bri: STREAM_BRI,
             sig: STREAM_SIG,
+            fun: false,
         };
         let before = stream.p;
 
@@ -3249,6 +3296,7 @@ mod tests {
             drag: INFALL_DRAG,
             ns: 0,
             debt: 0.0,
+            parked: false,
         };
         let mut stars = Stars::new();
         stars.live.push(make(V3::new(1.16, 0.0, 0.0)));
@@ -3354,79 +3402,57 @@ mod tests {
         assert!(back.dot(toward_camera) < 0.0);
     }
 
-    fn test_opt() -> Opt {
-        Opt {
-            mode: Mode::Ascii,
-            fps: 30.0,
-            zoom: 1.0,
-            speed: 1.0,
-            orbit: 0.0,
-            azi: 0.0,
-            tilt: CAM_TILT,
-            shift: 0.0,
-            color: true,
-            cols: 80,
-            rows: 24,
-            tpw: 160,
-            tph: 96,
-            rays: RAY_BUDGET,
-            one_shot: None,
-            star: false,
-            big_star: false,
-            super_star: false,
-            origin: None,
-            star_speed: None,
-            ramp: Vec::new(),
-        }
-    }
 
 
 
     #[test]
-    fn super_star_bleeds_slowly_and_keeps_its_distance() {
-        let o = test_opt();
+    fn super_star_parks_and_bleeds_slowly_through_the_funnel() {
         let mut stars = Stars::new();
-        stars.spawn_super(&o);
+        stars.spawn_super();
         assert!(stars.feed);
         assert_eq!(stars.live.len(), 1);
-        let r0 = stars.live[0].p.len();
-        assert!((SUPER_R0.0..=SUPER_R0.1).contains(&r0), "r0={r0}");
         // a second superstar never joins the first
-        stars.spawn_super(&o);
+        stars.spawn_super();
         assert_eq!(stars.live.len(), 1);
 
-        // ten simulated minutes: the drain is deliberately glacial
+        // ten simulated minutes: the donor never moves an inch - the frame
+        // holds still - while the funnel keeps drinking from it
+        let p0 = stars.live[0].p;
         let st = evolve(stars, 600.0, 0.1);
         let inf = &st.live[0];
         assert!(inf.alive, "the star should outlast the drain");
+        assert!((inf.p - p0).len() < 1e-12, "the parked star drifted");
         assert!(inf.m > 0.6, "drained too fast: m={}", inf.m);
-        assert!(inf.p.len() > 8.0, "fell in too fast: r={}", inf.p.len());
-        // the shed mass went into the bridge (or already down the hole),
-        // never into the void
+        assert!(st.streams.len() > 20, "funnel too sparse");
         let flown: f64 = st.streams.iter().map(|s| s.w).sum();
-        assert!(st.streams.len() > 10, "bridge too sparse");
         assert!(inf.m + flown <= 1.0 + 1e-9);
-        assert!(inf.m + flown < inf.m + 1.0); // trivially true; ledger below
         assert!(1.0 - inf.m > flown, "some mass must already be swallowed");
+        assert!(!st.rem.is_empty(), "the hole should have drunk by now");
     }
 
     #[test]
-    fn super_parcels_take_the_long_way_round() {
-        // one parcel launched the way the superstar sheds it: it must spiral
-        // for minutes (the whole point of the mode) yet still arrive within
-        // its own lifetime, so no shed mass is silently lost to cooling
-        let r = 23.0;
+    fn funnel_parcels_take_the_long_way_round() {
+        // one parcel launched exactly the way the parked donor sheds it: it
+        // must swing a long arc (the funnel is the show) yet still arrive
+        // within its own lifetime, so no shed mass is lost to cooling
+        let r = SUPER_PARK.len();
         let vc = (INFALL_GM * r).sqrt() / (r - RS);
+        let rad = SUPER_PARK.norm();
+        let tan = V3::new(0.0, 1.0, 0.0).cross(rad).norm();
         let mut s = Stream {
-            p: V3::new(r, 0.0, 0.0),
-            v: V3::new(0.0, 0.0, 1.0) * (vc * 0.86) + V3::new(-1.0, 0.0, 0.0) * (0.1 * vc),
+            p: SUPER_PARK * (1.0 - 0.02),
+            v: tan * (SUPER_FUN_F * vc) - rad * (SUPER_FUN_G * vc),
             w: SUPER_SHED_W,
             age: 0.0,
             life: SUPER_STREAM_LIFE,
             drag: SUPER_STREAM_DRAG,
             bri: SUPER_STREAM_BRI,
-            sig: SUPER_STREAM_SIG,
+            sig: STREAM_SIG,
+            fun: true,
         };
+        // near the horizon the PW speeds are so high that a 0.25 s sample
+        // can hop straight past the swallow radius, so the early exit is
+        // the arrival proof, not a sampled minimum radius
         let mut t = 0.0;
         while t < SUPER_STREAM_LIFE {
             if !s.advance(0.25, INFALL_GM) {
@@ -3434,7 +3460,7 @@ mod tests {
             }
             t += 0.25;
         }
-        assert!(t > 150.0, "fell in too fast: t={t}");
+        assert!(t > 20.0, "fell in too fast: t={t}");
         assert!(t < SUPER_STREAM_LIFE, "parcel cooled mid-flight: t={t}");
     }
 
@@ -3449,6 +3475,7 @@ mod tests {
             drag: INFALL_DRAG,
             bri: STREAM_BRI,
             sig: STREAM_SIG,
+            fun: false,
         };
         // without the superstar there is no flicker
         let mut plain = Stars::new();
@@ -3462,12 +3489,12 @@ mod tests {
         fed.advance(0.5);
         assert_eq!(fed.rem.len(), 1);
         let rem = &fed.rem[0];
-        // planted at 40*w (0.4) at the moment of swallowing and fading
+        // planted at 750*w (7.5) at the moment of swallowing and fading
         // exponentially since - so strictly between the just-planted value
         // and a full 0.5 s of fade
-        let full_fade = 0.4 * (-0.5 / (INFALL_FADE * 0.35)).exp();
-        assert!(rem.b < 0.4 && rem.b > full_fade - 1e-9);
-        assert!((rem.sc - (60.0_f64 * 0.01).cbrt()).abs() < 1e-12);
+        let full_fade = 7.5 * (-0.5 / (INFALL_FADE * 0.35)).exp();
+        assert!(rem.b < 7.5 && rem.b > full_fade - 1e-9);
+        assert!((rem.sc - (600.0_f64 * 0.01).cbrt()).abs() < 1e-12);
         assert!((rem.p.len() - 1.6).abs() < 1e-9);
     }
 
@@ -3499,4 +3526,5 @@ mod tests {
         // invalid UTF-8 falls back to the raw byte instead of garbage
         assert_eq!(first_char(&[0xff]), char::from(0xff_u8));
     }
+
 }
