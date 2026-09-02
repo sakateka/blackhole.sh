@@ -638,25 +638,32 @@ const GLOW_R: f64 = BIG_R0.1 + 3.5 * INFALL_SIG * 3.0 + 0.06 * BIG_R0.1;
 
 /// One recorded trace segment inside the glow shell: the endpoints (start
 /// position and the step vector), the midpoint's radius for the cheap radial
-/// pre-reject, the spatial length and the transmittance that was in effect
-/// when it was traced, and the pixel it belongs to. Storing these is what
-/// lets the glows move every frame without re-integrating the geodesics:
-/// the deposition just replays the gaussian sums over the bins it touches.
+/// pre-reject, the transmittance that was in effect when it was traced, and
+/// the pixel it belongs to. Storing these is what lets the glows move every
+/// frame without re-integrating the geodesics: the deposition just replays
+/// the gaussian sums over the bins it touches. The spatial length is
+/// re-derived from `sg` in f64 at deposition time - a separately stored
+/// f32 copy would round the axis direction off unit and corrupt the
+/// perpendicular distance by ~2*eps*along^2 on long segments.
 #[derive(Clone, Copy)]
 struct Seg {
     p0: [f32; 3],
     sg: [f32; 3],
     r: f32,
-    dl: f32,
     tr: f32,
     px: u32,
 }
 
-const AXIAL_L_N: usize = 256;
-const AXIAL_C_N: usize = 512;
-const AXIAL_L_MAX: f64 = 6.0;
-const AXIAL_C_MAX: f64 = 6.0;
-static AXIAL_LUT: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+/// The axial factor of a segment's glow integral is separable: it is the
+/// sum of one 1D function evaluated at the glow's axial distances from
+/// the segment's two endpoints (see `segment_glow_weight`). So a single
+/// small table of sqrt(pi/2) * erf(x / sqrt 2) with linear interpolation
+/// covers every (dl, along) pair exactly - no clamped length axis, no zero
+/// cutoff, no nearest-neighbour steps like the old 2D grid - and at 16 KB
+/// it stays resident in L1 instead of streaming from L2.
+const ERF_N: usize = 2048;
+const ERF_X: f64 = 7.0; // erf(7/sqrt 2) = 1 - 2e-12: saturated
+static ERF_LUT: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
 
 fn erf_approx(x: f64) -> f64 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
@@ -668,46 +675,53 @@ fn erf_approx(x: f64) -> f64 {
     sign * (1.0 - p * (-x * x).exp())
 }
 
-fn build_axial_lut() -> Vec<f32> {
-    let stride = AXIAL_C_N + 1;
-    let mut table = vec![0.0; (AXIAL_L_N + 1) * stride];
-    for li in 0..=AXIAL_L_N {
-        let l = li as f64 / AXIAL_L_N as f64 * AXIAL_L_MAX;
-        for ci in 0..=AXIAL_C_N {
-            let c = (ci as f64 / AXIAL_C_N as f64 * 2.0 - 1.0) * AXIAL_C_MAX;
-            let axial = (std::f64::consts::PI / 2.0).sqrt()
-                * (erf_approx((0.5 * l - c) / std::f64::consts::SQRT_2)
-                    + erf_approx((0.5 * l + c) / std::f64::consts::SQRT_2));
-            table[li * stride + ci] = axial as f32;
-        }
-    }
-    table
+fn build_erf_lut() -> Vec<f32> {
+    (0..=ERF_N)
+        .map(|i| {
+            let x = i as f64 / ERF_N as f64 * ERF_X;
+            ((std::f64::consts::PI / 2.0).sqrt() * erf_approx(x / std::f64::consts::SQRT_2)) as f32
+        })
+        .collect()
 }
 
+/// sqrt(pi/2) * erf(x / sqrt 2), odd in x, linear between nodes. Past
+/// ERF_X the remaining tail is below 2e-12, so the saturated endpoint is
+/// exact to well below the table's own resolution.
 #[inline]
-fn axial_sample(table: &[f32], l: f64, c: f64) -> f64 {
-    if c.abs() >= AXIAL_C_MAX {
-        return 0.0;
+fn axial_end(x: f64, t: &[f32]) -> f64 {
+    let a = x.abs();
+    let v = if a >= ERF_X {
+        (std::f64::consts::PI / 2.0).sqrt()
+    } else {
+        let f = a * (ERF_N as f64 / ERF_X);
+        let i = (f as usize).min(ERF_N - 1);
+        let lo = t[i] as f64;
+        lo + (t[i + 1] as f64 - lo) * (f - i as f64)
+    };
+    if x < 0.0 {
+        -v
+    } else {
+        v
     }
-    let fl = (l * (AXIAL_L_N as f64 / AXIAL_L_MAX)).clamp(0.0, AXIAL_L_N as f64);
-    let fc = ((c / AXIAL_C_MAX + 1.0) * 0.5 * AXIAL_C_N as f64).clamp(0.0, AXIAL_C_N as f64);
-    let li = (fl.round() as usize).min(AXIAL_L_N);
-    let ci = (fc.round() as usize).min(AXIAL_C_N);
-    let stride = AXIAL_C_N + 1;
-    table[li * stride + ci] as f64
 }
 
+/// The exact line integral of the glow's gaussian exp(-d^2 / 2 sig^2)
+/// along the segment, times the transmittance in effect when it was
+/// traced: split the glow offset into its axial and perpendicular parts,
+/// keep the perpendicular factor as-is and integrate the axial gaussian
+/// in closed form - erf at the distances from both endpoints. The length
+/// comes from `sg` itself so the axis stays exactly unit.
 #[inline]
-fn segment_glow_weight(gl: &Glow, s: &Seg, axial_table: &[f32]) -> f64 {
+fn segment_glow_weight(gl: &Glow, s: &Seg, erf_t: &[f32]) -> f64 {
     let (px, py, pz) = (s.p0[0] as f64, s.p0[1] as f64, s.p0[2] as f64);
     let (sx, sy, sz) = (s.sg[0] as f64, s.sg[1] as f64, s.sg[2] as f64);
-    let dl = s.dl as f64;
     let (dx, dy, dz) = (gl.p.x - px, gl.p.y - py, gl.p.z - pz);
+    let dl = (sx * sx + sy * sy + sz * sz).sqrt();
     let along = (dx * sx + dy * sy + dz * sz) / dl;
     let perp2 = (dx * dx + dy * dy + dz * dz - along * along).max(0.0);
-    let axial = axial_sample(axial_table, dl / gl.sig, (along - 0.5 * dl) / gl.sig);
-    let line = gl.sig * axial;
-    (-perp2 / (2.0 * gl.sig * gl.sig)).exp() * line * s.tr as f64
+    let inv = gl.sig.recip();
+    let axial = axial_end(along * inv, erf_t) + axial_end((dl - along) * inv, erf_t);
+    (-perp2 * inv * inv * 0.5).exp() * gl.sig * axial * s.tr as f64
 }
 
 /// Uniform bins over the cube of side BIN_N * BIN_W centred on the hole -
@@ -763,7 +777,7 @@ fn build_bins(segs: &mut [Seg], bin_off: &mut Vec<u32>) {
 /// the bins within the glow's reach, a few thousand segments instead of
 /// every segment tested against every glow.
 fn deposit_one(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut dyn FnMut(usize, [f64; 3])) {
-    let axial_table = AXIAL_LUT.get_or_init(build_axial_lut);
+    let erf_t = ERF_LUT.get_or_init(build_erf_lut);
     let gr = gl.p.len();
     let rej = gl.sig * 3.5 + 0.06 * gr;
     let range = (rej / BIN_W).ceil() as isize + 1;
@@ -780,7 +794,7 @@ fn deposit_one(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut dyn FnMut(usi
                     if (s.r as f64 - gr).abs() > rej + 1e-4 {
                         continue;
                     }
-                    let e = segment_glow_weight(gl, s, axial_table);
+                    let e = segment_glow_weight(gl, s, erf_t);
                     out(s.px as usize, [gl.c[0] * e, gl.c[1] * e, gl.c[2] * e]);
                 }
             }
@@ -1415,7 +1429,6 @@ fn record_glow_segment(p0: V3, p1: V3, tr: f64, px: usize, segs: &mut Vec<Seg>) 
             p0: [p0.x as f32, p0.y as f32, p0.z as f32],
             sg: [sg.x as f32, sg.y as f32, sg.z as f32],
             r: rm as f32,
-            dl: dl as f32,
             tr: tr as f32,
             px: px as u32,
         });
@@ -2835,37 +2848,61 @@ mod tests {
 
     #[test]
     fn gaussian_segment_integral_matches_numerical_quadrature() {
-        let p0 = V3::new(-0.8, 0.2, -0.1);
-        let p1 = V3::new(1.1, -0.3, 0.4);
-        let sg = p1 - p0;
-        let seg = Seg {
-            p0: [p0.x as f32, p0.y as f32, p0.z as f32],
-            sg: [sg.x as f32, sg.y as f32, sg.z as f32],
-            r: 0.0,
-            dl: sg.len() as f32,
-            tr: 0.37,
-            px: 0,
-        };
-        let glow = Glow {
-            p: V3::new(0.15, 0.45, 0.2),
-            c: [1.0; 3],
-            sig: 0.38,
-        };
-        let n = 20_000;
-        let mut numerical = 0.0;
-        for i in 0..n {
-            let u = (i as f64 + 0.5) / n as f64;
-            let d = p0 + sg * u - glow.p;
-            numerical += (-d.len2() / (2.0 * glow.sig * glow.sig)).exp();
-        }
-        numerical *= sg.len() / n as f64 * seg.tr as f64;
+        // covers: glow mid-segment, glow near an end of a segment much
+        // longer than sig (the old table clamped its length axis at 6 sig
+        // and halved this), and glow just past an end (where the old table
+        // hit its hard zero cutoff)
+        let cases = [
+            (
+                V3::new(-0.8, 0.2, -0.1),
+                V3::new(1.1, -0.3, 0.4),
+                V3::new(0.15, 0.45, 0.2),
+                0.38,
+            ),
+            (
+                V3::new(-6.0, 0.2, -0.1),
+                V3::new(6.0, -0.3, 0.4),
+                V3::new(3.0, 0.2328, 0.4328),
+                0.38,
+            ),
+            (
+                V3::new(-6.0, 0.2, -0.1),
+                V3::new(6.0, -0.3, 0.4),
+                V3::new(6.6094, -0.0426, 0.7082),
+                0.38,
+            ),
+        ];
+        let erf_t = ERF_LUT.get_or_init(build_erf_lut);
+        for (p0, p1, gp, sig) in cases {
+            let sg = p1 - p0;
+            let seg = Seg {
+                p0: [p0.x as f32, p0.y as f32, p0.z as f32],
+                sg: [sg.x as f32, sg.y as f32, sg.z as f32],
+                r: 0.0,
+                tr: 0.37,
+                px: 0,
+            };
+            let glow = Glow {
+                p: gp,
+                c: [1.0; 3],
+                sig,
+            };
+            let n = 200_000;
+            let mut numerical = 0.0;
+            for i in 0..n {
+                let u = (i as f64 + 0.5) / n as f64;
+                let d = p0 + sg * u - glow.p;
+                numerical += (-d.len2() / (2.0 * glow.sig * glow.sig)).exp();
+            }
+            numerical *= sg.len() / n as f64 * seg.tr as f64;
 
-        let analytic = segment_glow_weight(&glow, &seg, AXIAL_LUT.get_or_init(build_axial_lut));
-        let error = (analytic - numerical).abs();
-        assert!(
-            error < 1e-4,
-            "integral error: {error}, analytic={analytic}, numerical={numerical}"
-        );
+            let analytic = segment_glow_weight(&glow, &seg, erf_t);
+            let error = (analytic - numerical).abs();
+            assert!(
+                error < 1e-6,
+                "integral error: {error}, analytic={analytic}, numerical={numerical}"
+            );
+        }
     }
 
     #[test]
@@ -2895,6 +2932,60 @@ mod tests {
 
         assert!(geo.n > 0);
         assert!(split);
+    }
+
+    #[test]
+    #[ignore = "perf smoke: cargo test --release glow_deposit_throughput -- --ignored --nocapture"]
+    fn glow_deposit_throughput() {
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let next = |rng: &mut u64| {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng as f64 / u64::MAX as f64
+        };
+        let v3 = |rng: &mut u64| {
+            V3::new(
+                next(rng) * 10.0 - 5.0,
+                next(rng) * 10.0 - 5.0,
+                next(rng) * 10.0 - 5.0,
+            )
+        };
+        let mut segs = Vec::with_capacity(120_000);
+        for i in 0..120_000 {
+            let p0 = v3(&mut rng);
+            let p1 = p0 + v3(&mut rng) * 0.5;
+            let sg = p1 - p0;
+            segs.push(Seg {
+                p0: [p0.x as f32, p0.y as f32, p0.z as f32],
+                sg: [sg.x as f32, sg.y as f32, sg.z as f32],
+                r: ((p0 + sg * 0.5).len()) as f32,
+                tr: (0.2 + 0.8 * next(&mut rng)) as f32,
+                px: (i % 4096) as u32,
+            });
+        }
+        let mut bin_off = Vec::new();
+        build_bins(&mut segs, &mut bin_off);
+        let glows: Vec<Glow> = (0..40)
+            .map(|_| Glow {
+                p: v3(&mut rng) * 0.8,
+                c: [1.0; 3],
+                sig: 0.38 + 0.5 * next(&mut rng),
+            })
+            .collect();
+        let mut acc = vec![0.0f64; 4096];
+        let t0 = std::time::Instant::now();
+        for gl in &glows {
+            deposit_one(gl, &segs, &bin_off, &mut |px, add| {
+                acc[px] += add[0] + add[1] + add[2];
+            });
+        }
+        let dt = t0.elapsed();
+        let total: f64 = acc.iter().sum();
+        println!(
+            "deposit 40 glows x 120k segs: {dt:?} ({:.0} us/glow), sum={total:.3}",
+            dt.as_micros() / 40
+        );
     }
 
     #[test]
@@ -3067,4 +3158,5 @@ mod tests {
         assert!(front.dot(toward_camera) > 0.0);
         assert!(back.dot(toward_camera) < 0.0);
     }
+
 }
