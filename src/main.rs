@@ -1192,14 +1192,19 @@ fn deposit_bin_range(
     bin_off: &[u32],
     glows: &[GlowParams],
     erf_t: &[f32],
+    replay_fast: bool,
     buf: &mut GlowBuf,
 ) {
     for &bin in &active_bins[begin..end] {
         let b = bin as usize;
-        let bin_data = &bin_fast[bin_field[b] as usize];
-        let exact = bin_data.exact;
-        if bin_field[b] != u32::MAX && bin_data.peak >= FAST_BIN_LOD_MIN {
-            let field = &bin_data.field;
+        let slot = bin_field[b];
+        let exact = if slot == u32::MAX {
+            0
+        } else {
+            bin_fast[slot as usize].exact
+        };
+        if replay_fast && slot != u32::MAX && bin_fast[slot as usize].peak >= FAST_BIN_LOD_MIN {
+            let field = &bin_fast[slot as usize].field;
             // The compact arena is built before this kernel whenever a fast
             // glow exists. Keeping the fallback out of the hot loop makes
             // the common sparse-matrix representation branch-free.
@@ -1558,6 +1563,58 @@ impl FastBin {
     }
 }
 
+/// Apply one sparse matrix row's change directly to the persistent output
+/// accumulator. `FastBin::field` is the 64-wide sampled source vector and the
+/// packed `FastSeg` arena is the row's non-zero `(pixel, subcell)` entries.
+/// This is the temporal analogue of a CSR SpMV update: unchanged rows are not
+/// replayed at all, while a changed row subtracts its old vector and adds its
+/// new vector in one cache-friendly walk.
+#[inline]
+fn apply_fast_bin_delta(
+    bin: u32,
+    old: &FastBin,
+    new: &FastBin,
+    fast_segs: &[FastSeg],
+    fast_off: &[u32],
+    fast_accum: &mut [f32],
+) {
+    let b = bin as usize;
+    let Some((&start, &end)) = fast_off.get(b).zip(fast_off.get(b + 1)) else {
+        return;
+    };
+    let old_enabled = old.peak >= FAST_BIN_LOD_MIN;
+    let new_enabled = new.peak >= FAST_BIN_LOD_MIN;
+    if !old_enabled && !new_enabled {
+        return;
+    }
+    for fs in &fast_segs[start as usize..end as usize] {
+        let sub = (fs.px_sub & FAST_SUB_MASK) as usize;
+        let before = if old_enabled { old.field[sub] } else { 0.0 };
+        let after = if new_enabled { new.field[sub] } else { 0.0 };
+        fast_accum[(fs.px_sub >> FAST_SUB_BITS) as usize] += (after - before) * fs.weight;
+    }
+}
+
+/// Merge the persistent scalar fast result into the frame's RGB side buffer.
+/// The dense scan is over the small output grid, not the millions of cold
+/// segment records. A negative value can only be round-off from subtract/add
+/// deltas, so it is ignored rather than turning a glow into negative light.
+fn merge_fast_accum(fast_accum: &[f32], st: &mut [[f64; 3]], lit: &mut Vec<u32>) {
+    for (i, &energy) in fast_accum.iter().enumerate() {
+        if energy <= 0.0 {
+            continue;
+        }
+        let dst = &mut st[i];
+        if *dst == [0.0; 3] {
+            lit.push(i as u32);
+        }
+        let add = energy as f64;
+        dst[0] += add;
+        dst[1] += add * 0.75;
+        dst[2] += add * 0.45;
+    }
+}
+
 /// Fingerprint the inputs that affect one scalar fast source. A compact source
 /// generation mask can then mark only bins touched by changed sources instead
 /// of hashing every source again for every active bin.
@@ -1730,6 +1787,10 @@ struct GlowCache {
     /// stellar bins.
     fast_segs: Vec<FastSeg>,
     fast_off: Vec<u32>,
+    /// Persistent scalar result of the fast sparse multiply, one value per
+    /// output pixel. Dirty bins update this buffer by subtraction/addition;
+    /// unchanged bins never revisit their segment records.
+    fast_accum: Vec<f32>,
     active_bins: Vec<u32>,
     bufs: Vec<GlowBuf>,
     /// Pixels lit by the current deposition.
@@ -1752,6 +1813,7 @@ impl GlowCache {
             fast_param_keys: Vec::new(),
             fast_segs: Vec::new(),
             fast_off: Vec::new(),
+            fast_accum: Vec::new(),
             active_bins: Vec::new(),
             bufs: Vec::new(),
             lit: Vec::new(),
@@ -1779,6 +1841,7 @@ const FAST_FIELD_CACHE_MAX: usize = 131_072;
 /// glow-major: the same dense photon-sphere bin was streamed once per glow.
 /// Here a segment is loaded once, the bin's glow bitmask selects its sources,
 /// and the compact pixel accumulator is updated once.
+#[allow(clippy::too_many_arguments)]
 fn deposit_glow_chunk(
     segs: &[Seg],
     bin_off: &[u32],
@@ -1787,10 +1850,12 @@ fn deposit_glow_chunk(
     cache: &mut GlowCache,
     par: bool,
     nthreads: usize,
+    delta_fast: bool,
 ) {
     debug_assert!(glows.len() <= u64::BITS as usize);
     let bin_len = bin_off.len().saturating_sub(1);
-    if cache.bin_glows.len() != bin_len {
+    let same_bin_layout = cache.bin_glows.len() == bin_len;
+    if !same_bin_layout {
         cache.bin_glows.resize(bin_len, 0);
         cache.bin_field.clear();
         cache.bin_fast.clear();
@@ -1803,11 +1868,17 @@ fn deposit_glow_chunk(
 
     // The masks are sparse in practice. Clear only the bins used by the
     // preceding chunk/frame instead of streaming the whole 421k-bin array.
-    // The slot map and fields survive: they form the temporal cache.
-    for &bin in &cache.active_bins {
+    // The slot map and fields survive: they form the temporal cache. Keep the
+    // old list long enough to subtract rows that disappear this frame.
+    let previous_bins = if same_bin_layout {
+        std::mem::take(&mut cache.active_bins)
+    } else {
+        cache.active_bins.clear();
+        Vec::new()
+    };
+    for &bin in &previous_bins {
         cache.bin_glows[bin as usize] = 0;
     }
-    cache.active_bins.clear();
 
     let params_storage: Vec<GlowParams> = glows.iter().map(GlowParams::new).collect();
     let params: &[GlowParams] = &params_storage;
@@ -1831,20 +1902,68 @@ fn deposit_glow_chunk(
         let b = b as usize;
         bin_off[b] < bin_off[b + 1]
     });
-    if cache.active_bins.is_empty() {
-        return;
-    }
 
     // If a moving source would grow the persistent cache past its budget,
     // discard old slots and rebuild the current working set. This bounds the
     // long-running process instead of trading temporal coherence for a leak.
     let persistent = cache.active_bins.len() <= FAST_FIELD_CACHE_MAX;
-    if !persistent
-        || cache.bin_fast.len().saturating_add(cache.active_bins.len()) > FAST_FIELD_CACHE_MAX
-    {
+    let cache_reset = !persistent
+        || cache.bin_fast.len().saturating_add(cache.active_bins.len()) > FAST_FIELD_CACHE_MAX;
+    if cache_reset {
+        // The old rows are no longer addressable after a reset. Start the
+        // persistent output from zero and add the new working set below.
+        cache.fast_accum.fill(0.0);
         cache.bin_field.fill(u32::MAX);
         cache.bin_fast.clear();
         cache.fast_masks.clear();
+    }
+    let use_delta = delta_fast && persistent;
+    if cache.active_bins.is_empty() {
+        if use_delta {
+            // With no current rows the mathematical result is exactly zero.
+            // Reset the dense accumulator directly instead of spending a
+            // full sparse walk subtracting rows whose output is disappearing.
+            cache.fast_accum.fill(0.0);
+            let zero = FastBin::zero();
+            for &bin in &previous_bins {
+                let slot = cache.bin_field[bin as usize];
+                if slot == u32::MAX {
+                    continue;
+                }
+                cache.bin_fast[slot as usize] = zero;
+                cache.fast_masks[slot as usize] = 0;
+            }
+            merge_fast_accum(&cache.fast_accum, &mut cache.st, &mut cache.lit);
+        }
+        cache.fast_param_keys = current_param_keys;
+        return;
+    }
+    if use_delta {
+        // A row that leaves the active set must be removed from the output
+        // accumulator. Clear its cached field too, so reappearing in a later
+        // frame is treated as a new row and gets added back.
+        let zero = FastBin::zero();
+        for &bin in &previous_bins {
+            let b = bin as usize;
+            if cache.bin_glows[b] != 0 {
+                continue;
+            }
+            let slot = cache.bin_field[b];
+            if slot == u32::MAX {
+                continue;
+            }
+            let old = cache.bin_fast[slot as usize];
+            apply_fast_bin_delta(
+                bin,
+                &old,
+                &zero,
+                &cache.fast_segs,
+                &cache.fast_off,
+                &mut cache.fast_accum,
+            );
+            cache.bin_fast[slot as usize] = zero;
+            cache.fast_masks[slot as usize] = 0;
+        }
     }
 
     if persistent {
@@ -1895,7 +2014,18 @@ fn deposit_glow_chunk(
                 par,
                 nthreads,
             );
-            for (slot, field) in dirty_slots.into_iter().zip(dirty_fields) {
+            for ((bin, slot), field) in dirty_bins.into_iter().zip(dirty_slots).zip(dirty_fields) {
+                let old = cache.bin_fast[slot];
+                if use_delta {
+                    apply_fast_bin_delta(
+                        bin,
+                        &old,
+                        &field,
+                        &cache.fast_segs,
+                        &cache.fast_off,
+                        &mut cache.fast_accum,
+                    );
+                }
                 cache.bin_fast[slot] = field;
             }
         }
@@ -1920,88 +2050,100 @@ fn deposit_glow_chunk(
         );
     }
 
-    if cache.grid_len != grid_len {
-        // A size change is an I-frame event, so release all old worker
-        // capacities once instead of letting several grid sizes accumulate.
-        cache.bufs.clear();
-        cache.grid_len = grid_len;
+    let replay_exact = glows.iter().any(|gl| !gl.fast);
+    if use_delta {
+        // Fast rows have already updated the persistent scalar result. Merge
+        // it once over the output grid; if the chunk contains only fast
+        // sources there is no worker pass at all.
+        merge_fast_accum(&cache.fast_accum, &mut cache.st, &mut cache.lit);
     }
-    let bytes_per_buf = grid_len
-        .saturating_mul(std::mem::size_of::<[f64; 3]>())
-        .saturating_add(grid_len.saturating_mul(std::mem::size_of::<f32>()))
-        .max(1);
-    let memory_workers = (GLOW_BUF_BUDGET / bytes_per_buf).max(1);
-    let nt = if par {
-        nthreads.min(memory_workers).min(cache.active_bins.len())
-    } else {
-        1
-    };
-    let erf_t = ERF_LUT.get_or_init(build_erf_lut);
+    if !use_delta || replay_exact {
+        if cache.grid_len != grid_len {
+            // A size change is an I-frame event, so release all old worker
+            // capacities once instead of letting several grid sizes accumulate.
+            cache.bufs.clear();
+            cache.grid_len = grid_len;
+        }
+        let bytes_per_buf = grid_len
+            .saturating_mul(std::mem::size_of::<[f64; 3]>())
+            .saturating_add(grid_len.saturating_mul(std::mem::size_of::<f32>()))
+            .max(1);
+        let memory_workers = (GLOW_BUF_BUDGET / bytes_per_buf).max(1);
+        let nt = if par {
+            nthreads.min(memory_workers).min(cache.active_bins.len())
+        } else {
+            1
+        };
+        let erf_t = ERF_LUT.get_or_init(build_erf_lut);
 
-    let workers = nt.max(1);
-    while cache.bufs.len() < workers {
-        cache.bufs.push(GlowBuf::new());
-    }
-    for buf in cache.bufs.iter_mut().take(workers) {
-        buf.resize(grid_len);
-    }
+        let workers = nt.max(1);
+        while cache.bufs.len() < workers {
+            cache.bufs.push(GlowBuf::new());
+        }
+        for buf in cache.bufs.iter_mut().take(workers) {
+            buf.resize(grid_len);
+        }
 
-    if nt <= 1 {
-        {
+        let replay_fast = !use_delta;
+        if nt <= 1 {
+            {
+                let active_bins = &cache.active_bins;
+                let bin_field = &cache.bin_field;
+                let bin_fast = &cache.bin_fast;
+                let fast_segs = &cache.fast_segs;
+                let fast_off = &cache.fast_off;
+                let buf = &mut cache.bufs[0];
+                deposit_bin_range(
+                    active_bins,
+                    0,
+                    active_bins.len(),
+                    bin_field,
+                    bin_fast,
+                    fast_segs,
+                    fast_off,
+                    segs,
+                    bin_off,
+                    params,
+                    erf_t,
+                    replay_fast,
+                    buf,
+                );
+            }
+            reduce_glow_buf(&mut cache.bufs[0], &mut cache.st, &mut cache.lit);
+        } else {
+            let ranges = split_bin_work(&cache.active_bins, bin_off, nt);
             let active_bins = &cache.active_bins;
             let bin_field = &cache.bin_field;
             let bin_fast = &cache.bin_fast;
             let fast_segs = &cache.fast_segs;
             let fast_off = &cache.fast_off;
-            let buf = &mut cache.bufs[0];
-            deposit_bin_range(
-                active_bins,
-                0,
-                active_bins.len(),
-                bin_field,
-                bin_fast,
-                fast_segs,
-                fast_off,
-                segs,
-                bin_off,
-                params,
-                erf_t,
-                buf,
-            );
-        }
-        reduce_glow_buf(&mut cache.bufs[0], &mut cache.st, &mut cache.lit);
-    } else {
-        let ranges = split_bin_work(&cache.active_bins, bin_off, nt);
-        let active_bins = &cache.active_bins;
-        let bin_field = &cache.bin_field;
-        let bin_fast = &cache.bin_fast;
-        let fast_segs = &cache.fast_segs;
-        let fast_off = &cache.fast_off;
-        let bufs = &mut cache.bufs;
-        std::thread::scope(|sc| {
-            for ((begin, end), buf) in ranges.iter().copied().zip(bufs.iter_mut().take(nt)) {
-                sc.spawn(move || {
-                    deposit_bin_range(
-                        active_bins,
-                        begin,
-                        end,
-                        bin_field,
-                        bin_fast,
-                        fast_segs,
-                        fast_off,
-                        segs,
-                        bin_off,
-                        params,
-                        erf_t,
-                        buf,
-                    );
-                });
+            let bufs = &mut cache.bufs;
+            std::thread::scope(|sc| {
+                for ((begin, end), buf) in ranges.iter().copied().zip(bufs.iter_mut().take(nt)) {
+                    sc.spawn(move || {
+                        deposit_bin_range(
+                            active_bins,
+                            begin,
+                            end,
+                            bin_field,
+                            bin_fast,
+                            fast_segs,
+                            fast_off,
+                            segs,
+                            bin_off,
+                            params,
+                            erf_t,
+                            replay_fast,
+                            buf,
+                        );
+                    });
+                }
+            });
+            // Reduction remains deterministic in worker/range order. Fast field
+            // sums are accumulated in f32; exact stellar sums remain f64.
+            for buf in cache.bufs.iter_mut().take(ranges.len()) {
+                reduce_glow_buf(buf, &mut cache.st, &mut cache.lit);
             }
-        });
-        // Reduction remains deterministic in worker/range order. Fast field
-        // sums are accumulated in f32; exact stellar sums remain f64.
-        for buf in cache.bufs.iter_mut().take(ranges.len()) {
-            reduce_glow_buf(buf, &mut cache.st, &mut cache.lit);
         }
     }
 
@@ -2036,9 +2178,13 @@ fn deposit_glows(
 ) {
     if cache.st.len() != grid_len {
         cache.st = vec![[0.0; 3]; grid_len];
+        cache.fast_accum = vec![0.0; grid_len];
         cache.lit.clear();
         cache.previous_lit.clear();
         cache.mask.clear();
+    }
+    if cache.fast_accum.len() != grid_len {
+        cache.fast_accum = vec![0.0; grid_len];
     }
     if cache.mask.len() != grid_len {
         cache.mask.clear();
@@ -2054,6 +2200,10 @@ fn deposit_glows(
         cache.mask[px as usize] = true;
     }
     if glows.is_empty() || segs.is_empty() {
+        // Run the empty chunk once so rows from the preceding frame are
+        // subtracted from the persistent accumulator instead of leaving a
+        // temporal glow behind.
+        deposit_glow_chunk(segs, bin_off, &[], grid_len, cache, par, nthreads, true);
         return;
     }
     if glows.iter().any(|glow| glow.fast) && cache.fast_off.len() != bin_off.len() {
@@ -2068,8 +2218,18 @@ fn deposit_glows(
     // three ordinary stars). Chunking keeps the representation safe if a
     // future profile exceeds that limit, at the cost of another bin pass only
     // in that unusual case.
+    let delta_fast = glows.len() <= u64::BITS as usize;
+    if !delta_fast {
+        // Multi-chunk source lists use the bounded replay path. Do not leave
+        // the previous persistent result to be merged into this frame.
+        cache.fast_accum.fill(0.0);
+        cache.fast_masks.fill(0);
+        cache.bin_fast.fill(FastBin::zero());
+    }
     for chunk in glows.chunks(u64::BITS as usize) {
-        deposit_glow_chunk(segs, bin_off, chunk, grid_len, cache, par, nthreads);
+        deposit_glow_chunk(
+            segs, bin_off, chunk, grid_len, cache, par, nthreads, delta_fast,
+        );
     }
 }
 
@@ -3832,6 +3992,7 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
         // The geometry is being replaced, so the side-buffered glow values
         // no longer belong to these pixels even when the grid size is stable.
         cache.glow.st.clear();
+        cache.glow.fast_accum.clear();
         cache.glow.bin_glows.clear();
         cache.glow.bin_field.clear();
         cache.glow.bin_fast.clear();
@@ -4729,6 +4890,84 @@ mod tests {
 
         assert_eq!(cache.st[0], [0.0; 3]);
         assert!(cache.lit.is_empty());
+    }
+
+    #[test]
+    fn fast_delta_tracks_source_motion_and_clear() {
+        let o = Opt {
+            mode: Mode::Ascii,
+            funnel: FunnelMode::Spiral,
+            fps: 30.0,
+            zoom: 1.0,
+            speed: 1.0,
+            orbit: 0.0,
+            azi: 0.0,
+            tilt: CAM_TILT,
+            shift: 0.0,
+            color: false,
+            cols: 40,
+            rows: 20,
+            tpw: 80,
+            tph: 80,
+            rays: 40_000,
+            threads: 1,
+            one_shot: None,
+            star: false,
+            big_star: false,
+            super_star: false,
+            origin: None,
+            star_speed: None,
+            ramp: " .·:;+=*xX#%@█".chars().collect(),
+        };
+        let glow = |x| {
+            vec![Glow {
+                p: V3::new(x, 0.2, 0.0),
+                c: [100.0, 75.0, 45.0],
+                sig: 1.0,
+                fast: true,
+            }]
+        };
+        let first = glow(2.8);
+        let moved = glow(3.1);
+        let mut delta_frame = Frame {
+            w: 0,
+            h: 0,
+            px: Vec::new(),
+        };
+        let mut delta_cache = GeoCache::new();
+        render_frame(&o, 0.0, &mut delta_frame, &mut delta_cache, &first);
+        assert!(delta_cache.glow.fast_accum.iter().any(|&e| e > 0.0));
+        render_frame(&o, 1.0, &mut delta_frame, &mut delta_cache, &moved);
+
+        let mut fresh_frame = Frame {
+            w: 0,
+            h: 0,
+            px: Vec::new(),
+        };
+        let mut fresh_cache = GeoCache::new();
+        render_frame(&o, 1.0, &mut fresh_frame, &mut fresh_cache, &moved);
+        let max_error = delta_frame
+            .px
+            .iter()
+            .zip(&fresh_frame.px)
+            .map(|(a, b)| {
+                (a[0] - b[0])
+                    .abs()
+                    .max((a[1] - b[1]).abs())
+                    .max((a[2] - b[2]).abs())
+            })
+            .fold(0.0, f64::max);
+        assert!(max_error < 1e-5, "delta error: {max_error}");
+
+        render_frame(&o, 2.0, &mut delta_frame, &mut delta_cache, &[]);
+        let residual = delta_cache
+            .glow
+            .fast_accum
+            .iter()
+            .map(|&energy| energy.abs())
+            .fold(0.0, f32::max);
+        println!("delta residual: {residual}");
+        assert!(residual < 1e-5);
     }
 
     #[test]
