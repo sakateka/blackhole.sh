@@ -1545,6 +1545,43 @@ impl FastBin {
     }
 }
 
+/// Fingerprint the inputs that affect one scalar fast source. A compact source
+/// generation mask can then mark only bins touched by changed sources instead
+/// of hashing every source again for every active bin.
+#[inline]
+fn fast_source_key(gl: &GlowParams) -> u64 {
+    if !gl.fast {
+        return 0;
+    }
+    let mut key = 0xcbf2_9ce4_8422_2325u64;
+    for value in [
+        gl.p[0].to_bits(),
+        gl.p[1].to_bits(),
+        gl.p[2].to_bits(),
+        gl.c[0].to_bits(),
+        gl.sig.to_bits(),
+    ] {
+        key ^= value;
+        key = key.wrapping_mul(0x1000_0000_01b3);
+        key = key.rotate_left(7);
+    }
+    key
+}
+
+#[inline]
+fn exact_glow_mask(mask: u64, params: &[GlowParams]) -> u64 {
+    let mut exact = 0;
+    let mut bits = mask;
+    while bits != 0 {
+        let i = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        if !params[i].fast {
+            exact |= 1u64 << i;
+        }
+    }
+    exact
+}
+
 fn build_fast_bin(bin: u32, mask: u64, params: &[GlowParams], exp_t: &[f32]) -> FastBin {
     let b = bin as usize;
     let bx = b % BIN_N;
@@ -1667,6 +1704,13 @@ struct GlowCache {
     /// of megabytes for empty cells.
     bin_field: Vec<u32>,
     bin_fast: Vec<FastBin>,
+    /// Persistent fields, addressed by the dense `bin_field` slot map. Slots
+    /// survive frames so only bins whose source generation changed rebuild.
+    fast_masks: Vec<u64>,
+    /// Per-source fingerprints from the previous frame; their XOR-free bit
+    /// mask is used to dirty dependent bins without scanning every source in
+    /// every bin.
+    fast_param_keys: Vec<u64>,
     /// Compact hot-path copy of the segment metadata needed by the sampled
     /// funnel field. The full `Seg` arena remains available only for exact
     /// stellar bins.
@@ -1690,6 +1734,8 @@ impl GlowCache {
             bin_glows: Vec::new(),
             bin_field: Vec::new(),
             bin_fast: Vec::new(),
+            fast_masks: Vec::new(),
+            fast_param_keys: Vec::new(),
             fast_segs: Vec::new(),
             fast_off: Vec::new(),
             active_bins: Vec::new(),
@@ -1706,6 +1752,10 @@ impl GlowCache {
 /// grids deposition uses fewer workers instead of multiplying memory use by
 /// the machine's CPU count.
 const GLOW_BUF_BUDGET: usize = 32 * 1024 * 1024;
+/// Bound persistent fast-field slots so temporal coherence cannot turn a
+/// long-running orbit into an unbounded cache. A slot is 264 bytes at the
+/// current 4x4x4 sampling, so this is about 33 MiB plus the index table.
+const FAST_FIELD_CACHE_MAX: usize = 131_072;
 
 /// Lay the frame's glows over the cached geometry. Parallel workers retain
 /// their dense accumulation buffers between frames, but reduce and clear only
@@ -1728,22 +1778,35 @@ fn deposit_glow_chunk(
     let bin_len = bin_off.len().saturating_sub(1);
     if cache.bin_glows.len() != bin_len {
         cache.bin_glows.resize(bin_len, 0);
+        cache.bin_field.clear();
+        cache.bin_fast.clear();
+        cache.fast_masks.clear();
+        cache.fast_param_keys.clear();
     }
+    if cache.bin_field.len() != bin_len {
+        cache.bin_field.resize(bin_len, u32::MAX);
+    }
+
     // The masks are sparse in practice. Clear only the bins used by the
     // preceding chunk/frame instead of streaming the whole 421k-bin array.
-    for i in 0..cache.active_bins.len() {
-        let b = cache.active_bins[i] as usize;
-        cache.bin_glows[b] = 0;
-        if b < cache.bin_field.len() {
-            cache.bin_field[b] = u32::MAX;
-        }
+    // The slot map and fields survive: they form the temporal cache.
+    for &bin in &cache.active_bins {
+        cache.bin_glows[bin as usize] = 0;
     }
     cache.active_bins.clear();
-    cache.bin_fast.clear();
 
     let params_storage: Vec<GlowParams> = glows.iter().map(GlowParams::new).collect();
     let params: &[GlowParams] = &params_storage;
     let exp_t = FAST_EXP_LUT.get_or_init(build_fast_exp_lut);
+    let mut changed_fast_mask = 0u64;
+    let mut current_param_keys = Vec::with_capacity(params.len());
+    for (i, gl) in params.iter().enumerate() {
+        let key = fast_source_key(gl);
+        if cache.fast_param_keys.get(i).copied() != Some(key) && gl.fast {
+            changed_fast_mask |= 1u64 << i;
+        }
+        current_param_keys.push(key);
+    }
     for (i, gl) in params.iter().enumerate() {
         mark_glow_bins(gl, 1u64 << i, &mut cache.bin_glows, &mut cache.active_bins);
     }
@@ -1758,29 +1821,90 @@ fn deposit_glow_chunk(
         return;
     }
 
-    if cache.bin_field.len() != bin_len {
-        cache.bin_field.resize(bin_len, u32::MAX);
+    // If a moving source would grow the persistent cache past its budget,
+    // discard old slots and rebuild the current working set. This bounds the
+    // long-running process instead of trading temporal coherence for a leak.
+    let persistent = cache.active_bins.len() <= FAST_FIELD_CACHE_MAX;
+    if !persistent
+        || cache.bin_fast.len().saturating_add(cache.active_bins.len()) > FAST_FIELD_CACHE_MAX
+    {
+        cache.bin_field.fill(u32::MAX);
+        cache.bin_fast.clear();
+        cache.fast_masks.clear();
     }
-    cache.bin_fast.clear();
-    cache
-        .bin_fast
-        .resize(cache.active_bins.len(), FastBin::zero());
-    for (i, &bin) in cache.active_bins.iter().enumerate() {
-        cache.bin_field[bin as usize] = i as u32;
+
+    if persistent {
+        let mut dirty_bins = Vec::new();
+        let mut dirty_slots = Vec::new();
+        for &bin in &cache.active_bins {
+            let b = bin as usize;
+            let mask = cache.bin_glows[b];
+            let exact = exact_glow_mask(mask, params);
+            let fast_mask = mask & !exact;
+            let slot = if cache.bin_field[b] == u32::MAX {
+                let slot = cache.bin_fast.len() as u32;
+                cache.bin_field[b] = slot;
+                cache.bin_fast.push(FastBin::zero());
+                cache.fast_masks.push(0);
+                slot
+            } else {
+                cache.bin_field[b]
+            };
+            let slot_i = slot as usize;
+            let new_slot = cache.fast_masks[slot_i] == 0 && cache.bin_fast[slot_i].exact == 0;
+            if new_slot
+                || cache.fast_masks[slot_i] != fast_mask
+                || (fast_mask & changed_fast_mask) != 0
+            {
+                cache.fast_masks[slot_i] = fast_mask;
+                dirty_bins.push(bin);
+                dirty_slots.push(slot_i);
+            } else {
+                // Exact masks are cheap to refresh even when the scalar field
+                // is reusable: an exact glow may move inside its current bin.
+                cache.bin_fast[slot_i].exact = exact;
+            }
+        }
+
+        // Funnel groups are broad, low-contrast midpoint primitives. Rebuild
+        // only dirty fields; the existing bin worker splitter still
+        // parallelizes the misses without locks, while hits are just a slot
+        // lookup.
+        if !dirty_bins.is_empty() {
+            let mut dirty_fields = vec![FastBin::zero(); dirty_bins.len()];
+            build_fast_fields(
+                &dirty_bins,
+                &cache.bin_glows,
+                params,
+                exp_t,
+                &mut dirty_fields,
+                par,
+                nthreads,
+            );
+            for (slot, field) in dirty_slots.into_iter().zip(dirty_fields) {
+                cache.bin_fast[slot] = field;
+            }
+        }
+    } else {
+        // The active set itself is larger than the persistent cache budget.
+        // Use the old bounded working-set path for this frame and release it
+        // after reduction instead of allowing the cache to grow unbounded.
+        cache
+            .bin_fast
+            .resize(cache.active_bins.len(), FastBin::zero());
+        for (i, &bin) in cache.active_bins.iter().enumerate() {
+            cache.bin_field[bin as usize] = i as u32;
+        }
+        build_fast_fields(
+            &cache.active_bins,
+            &cache.bin_glows,
+            params,
+            exp_t,
+            &mut cache.bin_fast,
+            par,
+            nthreads,
+        );
     }
-    // Funnel groups are broad, low-contrast midpoint primitives. Accumulate
-    // their Gaussian field at a 4x4x4 sub-grid for each active bin. The
-    // independent bins make this setup parallel without locks; stellar glow
-    // masks travel with the same compact record and remain exact.
-    build_fast_fields(
-        &cache.active_bins,
-        &cache.bin_glows,
-        params,
-        exp_t,
-        &mut cache.bin_fast,
-        par,
-        nthreads,
-    );
 
     if cache.grid_len != grid_len {
         // A size change is an I-frame event, so release all old worker
@@ -1870,10 +1994,17 @@ fn deposit_glow_chunk(
     for i in 0..cache.active_bins.len() {
         let b = cache.active_bins[i] as usize;
         cache.bin_glows[b] = 0;
-        cache.bin_field[b] = u32::MAX;
     }
-    cache.bin_fast.clear();
-    cache.active_bins.clear();
+    if !persistent {
+        for &bin in &cache.active_bins {
+            cache.bin_field[bin as usize] = u32::MAX;
+        }
+        cache.bin_fast.clear();
+        cache.fast_masks.clear();
+        cache.fast_param_keys.clear();
+        cache.active_bins.clear();
+    }
+    cache.fast_param_keys = current_param_keys;
 }
 
 /// Lay the frame's glows over the cached geometry. Previous glow pixels are
@@ -3687,6 +3818,12 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
         // The geometry is being replaced, so the side-buffered glow values
         // no longer belong to these pixels even when the grid size is stable.
         cache.glow.st.clear();
+        cache.glow.bin_glows.clear();
+        cache.glow.bin_field.clear();
+        cache.glow.bin_fast.clear();
+        cache.glow.fast_masks.clear();
+        cache.glow.fast_param_keys.clear();
+        cache.glow.active_bins.clear();
         cache.glow.fast_segs.clear();
         cache.glow.fast_off.clear();
         // same reuse story as the pixel buffer: a stable-size re-trace (zoom)
@@ -4778,12 +4915,13 @@ mod tests {
         }
         let dt = t0.elapsed();
         println!(
-            "render 64 dense frames: {dt:?} ({:.0} us/frame), streams={}, glows={}, segs={}, fast_segs={}",
+            "render 64 dense frames: {dt:?} ({:.0} us/frame), streams={}, glows={}, segs={}, fast_segs={}, field_slots={}",
             dt.as_micros() as f64 / 64.0,
             stars.streams.len(),
             glows.len(),
             cache.segs.len(),
             cache.glow.fast_segs.len(),
+            cache.glow.bin_fast.len(),
         );
         std::hint::black_box(frame.px[0]);
     }
