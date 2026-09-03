@@ -3699,9 +3699,10 @@ OPTIONS
                         speed: 1 = circular orbit, 0 = dropped from rest,
                         negative = the orbit run backwards (default: random)
 
-KEYS        q/Esc quit    +/- zoom    up/down tilt    left/right orbit rate    space pause
-            < / > simulation speed slower/faster (same physical keys in any
-            keyboard layout)
+KEYS        q/Esc quit    +/- zoom    up/down tilt    left/right orbit rate
+            Alt+left/right reset orbit    space pause
+            < / > simulation speed slower/faster; Alt+< / > reset to 1x
+            (same physical keys in any keyboard layout)
             s spawn star    S spawn big star    b spawn super star    x clear stars
 ";
 
@@ -3814,6 +3815,7 @@ impl Drop for RawTerm {
 }
 
 /// A keypress, with arrow escape sequences told apart from a plain Esc.
+#[derive(Debug, PartialEq, Eq)]
 enum Key {
     Char(char),
     /// A character prefixed by ESC, as sent by terminals for Alt+key.
@@ -3823,6 +3825,10 @@ enum Key {
     Down,
     Left,
     Right,
+    AltUp,
+    AltDown,
+    AltLeft,
+    AltRight,
 }
 
 /// Camera tilt step per arrow press, in degrees (terminals auto-repeat held
@@ -3833,7 +3839,8 @@ const TILT_STEP: f64 = 1.0;
 const TILT_LIMIT: f64 = 80.0;
 
 /// Orbit rate step per arrow press, in degrees per second (held keys
-/// auto-repeat, so this is also how fast the rate itself slews).
+/// auto-repeat, so this is also how fast the rate itself slews). Alt+left or
+/// Alt+right resets the rate to zero.
 const ORBIT_STEP: f64 = 1.0;
 const ORBIT_MAX: f64 = 90.0;
 
@@ -3859,6 +3866,14 @@ fn step_speed(speed: f64, up: bool) -> f64 {
     }
 }
 
+/// Advance the camera by wall-clock time. Unlike the disk and infalling
+/// matter, the camera orbit is a presentation control and must not be scaled
+/// by the simulation-speed multiplier.
+#[inline]
+fn advance_orbit(azi: f64, orbit: f64, wall_dt: f64) -> f64 {
+    azi + orbit.to_radians() * wall_dt
+}
+
 /// The first UTF-8 character of a keypress, or the raw byte as a fallback
 /// for anything that is not valid UTF-8. A terminal in a non-Latin layout
 /// sends multi-byte characters for the very physical keys whose ASCII a
@@ -3876,53 +3891,73 @@ fn is_alt_speed_reset(ch: char) -> bool {
     matches!(ch, '<' | '>' | ',' | '.' | 'б' | 'Б' | 'ю' | 'Ю')
 }
 
+fn arrow_key(c: u8, alt: bool) -> Option<Key> {
+    match (c, alt) {
+        (b'A', false) => Some(Key::Up),
+        (b'B', false) => Some(Key::Down),
+        (b'C', false) => Some(Key::Right),
+        (b'D', false) => Some(Key::Left),
+        (b'A', true) => Some(Key::AltUp),
+        (b'B', true) => Some(Key::AltDown),
+        (b'C', true) => Some(Key::AltRight),
+        (b'D', true) => Some(Key::AltLeft),
+        _ => None,
+    }
+}
+
+/// Decode the common xterm cursor-key encodings. Alt+arrow is normally sent
+/// as CSI `1;3A` through `1;3D`, while an unmodified arrow is `CSI A` through
+/// `CSI D` (or the equivalent application-cursor `SS3` sequence).
+fn decode_escape_key(b: &[u8]) -> Option<Key> {
+    if b.len() < 2 {
+        return None;
+    }
+    if b[1] != b'[' && b[1] != b'O' {
+        return Some(Key::AltChar(first_char(&b[1..])));
+    }
+    if b.len() >= 3 {
+        if let Some(key) = arrow_key(b[2], false) {
+            return Some(key);
+        }
+    }
+    if b[1] == b'[' && b.len() >= 6 && &b[2..5] == b"1;3" {
+        return arrow_key(b[5], true);
+    }
+    None
+}
+
 /// Poll stdin for one key. Arrow keys arrive as 3-byte bursts (`ESC [ A`, or
 /// `ESC O A` in application cursor mode); a lone ESC is either the Esc key
 /// or a burst that came in fragmented, so give the terminal a few
 /// milliseconds to finish it before deciding.
 fn poll_key() -> Option<Key> {
-    let seq = |c: u8| match c {
-        b'A' => Some(Key::Up),
-        b'B' => Some(Key::Down),
-        b'C' => Some(Key::Right),
-        b'D' => Some(Key::Left),
-        _ => None,
-    };
     let mut b = [0u8; 8];
-    let n = match std::io::stdin().read(&mut b) {
+    let mut n = match std::io::stdin().read(&mut b) {
         Ok(0) | Err(_) => return None,
         Ok(n) => n,
     };
     if b[0] != 0x1b {
         return Some(Key::Char(first_char(&b[..n])));
     }
-    if n >= 3 && (b[1] == b'[' || b[1] == b'O') {
-        return seq(b[2]);
-    }
-    // xterm-compatible terminals normally encode Alt+<key> as ESC followed
-    // by the key. Keep it distinct from a plain key so modified speed reset
-    // bindings do not accidentally affect the regular < / > controls.
-    if n >= 2 && b[1] != b'[' && b[1] != b'O' {
-        return Some(Key::AltChar(first_char(&b[1..n])));
+
+    // An escape sequence can be split across reads. Give it a few
+    // milliseconds to arrive in full, which also keeps a lone Escape key
+    // distinct from Alt and from a cursor-key sequence.
+    for _ in 0..8 {
+        if let Some(key) = decode_escape_key(&b[..n]) {
+            return Some(key);
+        }
+        if n == b.len() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+        n += std::io::stdin().read(&mut b[n..]).unwrap_or(0);
     }
     if n == 1 {
-        let mut m = 0;
-        for _ in 0..3 {
-            thread::sleep(Duration::from_millis(1));
-            m += std::io::stdin().read(&mut b[1 + m..]).unwrap_or(0);
-            if m >= 2 {
-                break;
-            }
-        }
-        if m >= 2 && (b[1] == b'[' || b[1] == b'O') {
-            return seq(b[2]);
-        }
-        if m >= 1 && b[1] != b'[' && b[1] != b'O' {
-            return Some(Key::AltChar(first_char(&b[1..1 + m])));
-        }
-        return Some(Key::Esc);
+        Some(Key::Esc)
+    } else {
+        decode_escape_key(&b[..n])
     }
-    None
 }
 
 // ---------------------------------------------------------------- renderers
@@ -4719,8 +4754,9 @@ fn main() {
     let mut out = String::with_capacity(1 << 22);
 
     if let Some(n) = o.one_shot {
-        let t = n / o.fps * o.speed;
-        let final_azi = o.orbit.to_radians() * t;
+        let wall_t = n / o.fps;
+        let t = wall_t * o.speed;
+        let final_azi = advance_orbit(o.azi, o.orbit, wall_t);
         let mut f = Frame {
             w: 0,
             h: 0,
@@ -4791,7 +4827,7 @@ fn main() {
         last = Instant::now();
         if !paused {
             t += step * o.speed;
-            o.azi += o.orbit.to_radians() * step * o.speed;
+            o.azi = advance_orbit(o.azi, o.orbit, step);
             stars.advance(step * o.speed);
         }
         if !paused || !drawn {
@@ -4886,6 +4922,9 @@ fn main() {
                 }
                 Key::Left => {
                     o.orbit = (o.orbit - ORBIT_STEP).max(-ORBIT_MAX);
+                }
+                Key::AltLeft | Key::AltRight => {
+                    o.orbit = 0.0;
                 }
                 // drop another star into the well / clear the ones in flight
                 Key::Char('s') => {
@@ -5677,6 +5716,29 @@ mod tests {
         assert_eq!(first_char("\u{044e}".as_bytes()), '\u{044e}'); // ю
         assert_eq!(first_char("\u{042e}".as_bytes()), '\u{042e}'); // Ю
         assert_eq!(first_char(&[0xff]), char::from(0xff_u8));
+    }
+
+    #[test]
+    fn orbit_advance_uses_wall_time_not_simulation_speed() {
+        let wall_dt = 2.5;
+        let orbit = 12.0;
+        let slow_simulation_time = wall_dt * 0.25;
+        let fast_simulation_time = wall_dt * 8.0;
+
+        assert_ne!(slow_simulation_time, fast_simulation_time);
+        let slow = advance_orbit(0.0, orbit, wall_dt);
+        let fast = advance_orbit(0.0, orbit, wall_dt);
+
+        assert_eq!(slow, fast);
+        assert!((slow - orbit.to_radians() * wall_dt).abs() < 1e-12);
+    }
+
+    #[test]
+    fn alt_horizontal_arrows_decode_as_orbit_reset_keys() {
+        assert_eq!(decode_escape_key(b"\x1b[1;3D"), Some(Key::AltLeft));
+        assert_eq!(decode_escape_key(b"\x1b[1;3C"), Some(Key::AltRight));
+        assert_eq!(decode_escape_key(b"\x1b[D"), Some(Key::Left));
+        assert_eq!(decode_escape_key(b"\x1b[C"), Some(Key::Right));
     }
 
     #[test]
