@@ -655,7 +655,7 @@ const SUPER_STREAM_SIG_MAX: f64 = 2.4;
 /// safety margin; the exact integrator remains in use for every retained
 /// segment.
 const GLOW_CUTOFF_DIM: f64 = 4.0;
-const GLOW_CUTOFF_BRIGHT: f64 = 7.0;
+const GLOW_CUTOFF_BRIGHT: f64 = 5.0;
 /// The traced adaptive step is at most 1.1 scene units; this conservative
 /// half-length keeps the midpoint reject from excluding any retained segment.
 const GLOW_SEG_HALF_MAX: f64 = 1.0;
@@ -716,22 +716,62 @@ struct Glow {
 /// inside this radius is worth recording for the deposition to chew on.
 const GLOW_R: f64 = BIG_R0.1 + 3.5 * INFALL_SIG * 3.0 + 0.06 * BIG_R0.1;
 
-/// One recorded trace segment inside the glow shell: the endpoints (start
-/// position and the step vector), the midpoint's radius for the cheap radial
-/// pre-reject, the transmittance that was in effect when it was traced, and
-/// the pixel it belongs to. Storing these is what lets the glows move every
-/// frame without re-integrating the geodesics: the deposition just replays
-/// the gaussian sums over the bins it touches. The spatial length is
-/// re-derived from `sg` in f64 at deposition time - a separately stored
-/// f32 copy would round the axis direction off unit and corrupt the
-/// perpendicular distance by ~2*eps*along^2 on long segments.
+/// One recorded trace segment inside the glow shell, pre-rotated into the
+/// glow's own coordinate frame: the midpoint `m` (the position the bin index
+/// and the tail cutoff work on), the unit axis `u`, the length `dl` and the
+/// midpoint's squared radius `r2` for the cheap radial pre-reject, the
+/// transmittance that was in effect when it was traced, and the pixel it
+/// belongs to. Everything a glow needs about the segment is already here, so
+/// the hot deposition loop is pure arithmetic: no square root, no division,
+/// no re-derivation of the axis from the endpoints.
+///
+/// Storing these is what lets the glows move every frame without
+/// re-integrating the geodesics: the deposition just replays the gaussian
+/// sums over the bins it touches. `u` and `dl` are rounded to f32 at record
+/// time; the resulting perpendicular-distance error is of order 1e-7
+/// relative, the same magnitude as the f32 endpoint quantization the record
+/// always had, and far below the display quantisation the cutoffs keep.
 #[derive(Clone, Copy)]
 struct Seg {
-    p0: [f32; 3],
-    sg: [f32; 3],
-    r: f32,
+    m: [f32; 3],
+    u: [f32; 3],
+    dl: f32,
+    /// squared midpoint radius, for the cheap radial pre-reject
+    r2: f32,
     tr: f32,
     px: u32,
+}
+
+impl Seg {
+    /// Record one step of a ray as a glow segment, unless it is degenerate
+    /// or lies entirely outside the shell any glow can light.
+    fn from_endpoints(p0: V3, p1: V3, tr: f64, px: usize) -> Option<Seg> {
+        let sg = p1 - p0;
+        let dl = sg.len();
+        if dl <= 1e-12 {
+            return None;
+        }
+        // one reciprocal instead of three divisions: the axis is rounded to
+        // f32 right after anyway
+        let inv_dl = dl.recip();
+        let m = p0 + sg * 0.5;
+        let rm = m.len();
+        if rm >= GLOW_R {
+            return None;
+        }
+        Some(Seg {
+            m: [m.x as f32, m.y as f32, m.z as f32],
+            u: [
+                (sg.x * inv_dl) as f32,
+                (sg.y * inv_dl) as f32,
+                (sg.z * inv_dl) as f32,
+            ],
+            dl: dl as f32,
+            r2: (rm * rm) as f32,
+            tr: tr as f32,
+            px: px as u32,
+        })
+    }
 }
 
 /// The axial factor of a segment's glow integral is separable: it is the
@@ -764,6 +804,26 @@ fn build_erf_lut() -> Vec<f32> {
         .collect()
 }
 
+/// e^(-x) for x >= 0 without the libm call: reduce to 2^(-x/ln 2), split
+/// into an integer part (folded straight into the exponent bits) and a
+/// reduced argument in [-ln2/2, ln2/2], and evaluate exp with the Taylor
+/// polynomial of degree 6. The relative error stays below 2e-7 - two orders
+/// under the display quantisation the glow cutoffs already enforce - and
+/// the hot deposition loop saves the indirect call per touched segment.
+#[inline(always)]
+fn fast_exp_neg(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 1.0;
+    }
+    let y = -x * std::f64::consts::LOG2_E;
+    let n = (y + 0.5).floor() as i32;
+    let z = (y - n as f64) * std::f64::consts::LN_2;
+    let p = 1.0
+        + z * (1.0
+            + z * (0.5 + z * (1.0 / 6.0 + z * (1.0 / 24.0 + z * (1.0 / 120.0 + z / 720.0)))));
+    p * f64::from_bits(((n + 1023) as u64) << 52)
+}
+
 /// sqrt(pi/2) * erf(x / sqrt 2), odd in x, linear between nodes. Past
 /// ERF_X the remaining tail is below 2e-12, so the saturated endpoint is
 /// exact to well below the table's own resolution.
@@ -787,39 +847,63 @@ fn axial_end(x: f64, t: &[f32]) -> f64 {
 
 /// The exact line integral of the glow's gaussian exp(-d^2 / 2 sig^2)
 /// along the segment, times the transmittance in effect when it was
-/// traced: split the glow offset into its axial and perpendicular parts,
-/// keep the perpendicular factor as-is and integrate the axial gaussian
-/// in closed form - erf at the distances from both endpoints. The length
-/// comes from `sg` itself so the axis stays exactly unit.
+/// traced: split the glow offset into its axial and perpendicular parts
+/// (relative to the midpoint, which the tail cutoff already needs, so the
+/// two share every product), keep the perpendicular factor as-is and
+/// integrate the axial gaussian in closed form - erf at the distances from
+/// both endpoints. The segment's stored unit axis and length make this
+/// root-free and division-free.
+/// Reference form of the exact integral, used by the quadrature test; the
+/// deposition loop calls `segment_glow_weight_at` with the per-glow
+/// constants it already has.
+#[cfg(test)]
 #[inline]
 fn segment_glow_weight(gl: &Glow, s: &Seg, erf_t: &[f32]) -> f64 {
-    let (px, py, pz) = (s.p0[0] as f64, s.p0[1] as f64, s.p0[2] as f64);
-    let (sx, sy, sz) = (s.sg[0] as f64, s.sg[1] as f64, s.sg[2] as f64);
-    let (dx, dy, dz) = (gl.p.x - px, gl.p.y - py, gl.p.z - pz);
-    let dl = (sx * sx + sy * sy + sz * sz).sqrt();
-    let along = (dx * sx + dy * sy + dz * sz) / dl;
-    let perp2 = (dx * dx + dy * dy + dz * dz - along * along).max(0.0);
     let inv = gl.sig.recip();
+    segment_glow_weight_at(
+        gl,
+        s,
+        erf_t,
+        inv,
+        inv * inv * 0.5,
+        gl.p.x - s.m[0] as f64,
+        gl.p.y - s.m[1] as f64,
+        gl.p.z - s.m[2] as f64,
+    )
+}
+
+/// The exact line integral above, with the per-glow constants and the
+/// midpoint offset already computed by the caller (the tail cutoff needs
+/// the same products, so nothing is evaluated twice).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn segment_glow_weight_at(
+    gl: &Glow,
+    s: &Seg,
+    erf_t: &[f32],
+    inv: f64,
+    inv2h: f64,
+    dmx: f64,
+    dmy: f64,
+    dmz: f64,
+) -> f64 {
+    let dm2 = dmx * dmx + dmy * dmy + dmz * dmz;
+    let q = dmx * s.u[0] as f64 + dmy * s.u[1] as f64 + dmz * s.u[2] as f64;
+    let perp2 = (dm2 - q * q).max(0.0);
+    let dl = s.dl as f64;
+    let along = q + 0.5 * dl;
     let axial = axial_end(along * inv, erf_t) + axial_end((dl - along) * inv, erf_t);
-    (-perp2 * inv * inv * 0.5).exp() * gl.sig * axial * s.tr as f64
+    fast_exp_neg(perp2 * inv2h) * gl.sig * axial * s.tr as f64
 }
 
 /// Fast quadrature for the broad, low-contrast funnel groups. Their Gaussian
 /// radius is comparable to a traced segment, so sampling the segment midpoint
 /// is sufficient at terminal precision and avoids the two axial LUT lookups.
+/// The midpoint offset and the folded inverse variance are exactly what the
+/// tail cutoff and the exact path already computed.
 #[inline(always)]
-fn segment_glow_midpoint(gl: &Glow, s: &Seg) -> f64 {
-    let px = s.p0[0] as f64 + 0.5 * s.sg[0] as f64;
-    let py = s.p0[1] as f64 + 0.5 * s.sg[1] as f64;
-    let pz = s.p0[2] as f64 + 0.5 * s.sg[2] as f64;
-    let dx = gl.p.x - px;
-    let dy = gl.p.y - py;
-    let dz = gl.p.z - pz;
-    let dl = (s.sg[0] as f64 * s.sg[0] as f64
-        + s.sg[1] as f64 * s.sg[1] as f64
-        + s.sg[2] as f64 * s.sg[2] as f64)
-        .sqrt();
-    (-0.5 * (dx * dx + dy * dy + dz * dz) / (gl.sig * gl.sig)).exp() * dl * s.tr as f64
+fn segment_glow_midpoint(dm2: f64, inv2h: f64, s: &Seg) -> f64 {
+    fast_exp_neg(dm2 * inv2h) * s.dl as f64 * s.tr as f64
 }
 
 /// Uniform bins over the cube of side BIN_N * BIN_W centred on the hole -
@@ -833,37 +917,48 @@ const BIN_C: isize = (BIN_N as isize) / 2;
 
 /// The bin a segment's midpoint falls in, clamped to the cube's edge.
 fn bin_of(s: &Seg) -> usize {
-    let c = |a: f32, v: f32| {
-        let m = a as f64 + 0.5 * v as f64;
-        (((m / BIN_W).floor() as isize) + BIN_C).clamp(0, BIN_N as isize - 1)
-    };
-    let x = c(s.p0[0], s.sg[0]);
-    let y = c(s.p0[1], s.sg[1]);
-    let z = c(s.p0[2], s.sg[2]);
+    let c = |m: f32| ((((m as f64) / BIN_W).floor() as isize) + BIN_C).clamp(0, BIN_N as isize - 1);
+    let x = c(s.m[0]);
+    let y = c(s.m[1]);
+    let z = c(s.m[2]);
     (x + BIN_N as isize * (y + BIN_N as isize * z)) as usize
 }
 
 /// Sort the segments into their bins: count per bin, turn the counts into
 /// exclusive prefix offsets, then permute in place - each swap drops one
 /// segment into its bin's next free slot, so no second arena is needed.
-fn build_bins(segs: &mut [Seg], bin_off: &mut Vec<u32>) {
+/// The bin index computed by the counting pass is kept in `bins` so the
+/// permutation does not have to derive it again for every element (and for
+/// every element swapped in): at ten million segments that is the better
+/// part of the sort's cost. The scratch buffer is retained between
+/// re-traces so its pages stay warm.
+fn build_bins(segs: &mut [Seg], bin_off: &mut Vec<u32>, bins: &mut Vec<u32>, cur: &mut Vec<u32>) {
     bin_off.clear();
     bin_off.resize(BIN_N * BIN_N * BIN_N + 1, 0);
+    bins.clear();
+    bins.reserve(segs.len());
     for s in segs.iter() {
-        bin_off[bin_of(s) + 1] += 1;
+        let b = bin_of(s) as u32;
+        bins.push(b);
+        bin_off[b as usize + 1] += 1;
     }
     for i in 1..bin_off.len() {
         bin_off[i] += bin_off[i - 1];
     }
-    let mut cur = bin_off[..bin_off.len() - 1].to_vec();
     let mut i = 0;
+    // `cur` is a caller-owned scratch buffer: re-allocating the bin-offset
+    // copy on every re-trace would fault in the same megabytes again and
+    // again for no benefit.
+    cur.clear();
+    cur.extend_from_slice(&bin_off[..bin_off.len() - 1]);
     while i < segs.len() {
-        let b = bin_of(&segs[i]);
+        let b = bins[i] as usize;
         if (i as u32) >= bin_off[b] && (i as u32) < bin_off[b + 1] {
             i += 1;
         } else {
             let t = cur[b] as usize;
             segs.swap(i, t);
+            bins.swap(i, t);
             cur[b] += 1;
         }
     }
@@ -948,6 +1043,13 @@ where
         ydist[i] = point_axis_min(i as isize, gl.p.y);
         zdist[i] = point_axis_min(i as isize, gl.p.z);
     }
+    // The Gaussian scale and the colour are glow-constant: fold them once
+    // per glow instead of once per touched segment. Neither kernel needs a
+    // further scale factor - the exact integral folds `gl.sig` in
+    // analytically, the midpoint quadrature has none.
+    let inv = gl.sig.recip();
+    let inv2h = inv * inv * 0.5;
+    let cs = gl.c;
     for z in (gz - range).max(0)..=(gz + range).min(last) {
         let (zmin, zmax) = axis_bounds(z);
         for y in (gy - range).max(0)..=(gy + range).min(last) {
@@ -963,29 +1065,36 @@ where
                 let b = (x + BIN_N as isize * (y + BIN_N as isize * z)) as usize;
                 for s in &segs[bin_off[b] as usize..bin_off[b + 1] as usize] {
                     // cheap radial pre-reject: the glow lives in a shell
-                    // around the hole at its own radius
-                    if (s.r as f64 - gr).abs() > rej + 1e-4 {
+                    // around the hole at its own radius. The squared form
+                    // avoids the square root the record used to pay just to
+                    // store an unsquared radius.
+                    let r2 = s.r2 as f64;
+                    if r2 < inner2 || r2 > outer2 {
                         continue;
                     }
                     // The Gaussian never reaches mathematical zero. The
                     // midpoint bound drops only tails below display
                     // quantisation, before paying for the two erf lookups
-                    // and the exponential in the exact weight.
-                    let mx = s.p0[0] as f64 + 0.5 * s.sg[0] as f64;
-                    let my = s.p0[1] as f64 + 0.5 * s.sg[1] as f64;
-                    let mz = s.p0[2] as f64 + 0.5 * s.sg[2] as f64;
-                    let dx = gl.p.x - mx;
-                    let dy = gl.p.y - my;
-                    let dz = gl.p.z - mz;
-                    if dx * dx + dy * dy + dz * dz > reach2 {
+                    // and the exponential in the exact weight. The same
+                    // offset then feeds the integral itself.
+                    let (dmx, dmy, dmz) = (
+                        gl.p.x - s.m[0] as f64,
+                        gl.p.y - s.m[1] as f64,
+                        gl.p.z - s.m[2] as f64,
+                    );
+                    let dm2 = dmx * dmx + dmy * dmy + dmz * dmz;
+                    if dm2 > reach2 {
                         continue;
                     }
+                    // The exact kernel folds in `gl.sig` analytically; the
+                    // midpoint quadrature has no scale factor of its own, so
+                    // both paths just multiply their kernel by the colour.
                     let e = if FAST {
-                        segment_glow_midpoint(gl, s)
+                        segment_glow_midpoint(dm2, inv2h, s)
                     } else {
-                        segment_glow_weight(gl, s, erf_t)
+                        segment_glow_weight_at(gl, s, erf_t, inv, inv2h, dmx, dmy, dmz)
                     };
-                    out(s.px as usize, [gl.c[0] * e, gl.c[1] * e, gl.c[2] * e]);
+                    out(s.px as usize, [cs[0] * e, cs[1] * e, cs[2] * e]);
                 }
             }
         }
@@ -1795,8 +1904,10 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
 /// pattern drift rate and the fully pre-weighted static emission.
 #[derive(Clone, Copy)]
 struct Cross {
-    x: f64,
-    z: f64,
+    /// azimuth of the crossing point, atan2(hp.z, hp.x) - a geometric
+    /// constant of the cached geodesic, so the per-frame shading needs no
+    /// atan2 at all (it only drifts the pattern by orb - t*om)
+    phi: f64,
     /// angular drift rate of the turbulence pattern at this radius
     om: f64,
     /// static emission (colour, profile, Doppler beaming, transmittance and
@@ -1835,8 +1946,7 @@ impl Geo {
             esc: V3::new(0.0, 0.0, 0.0),
             n: 0,
             cr: [Cross {
-                x: 0.0,
-                z: 0.0,
+                phi: 0.0,
                 om: 0.0,
                 rr: 0.0,
                 em: [0.0; 3],
@@ -1859,6 +1969,16 @@ struct GeoCache {
     /// per-frame glow deposition scans these instead of re-integrating
     segs: Vec<Seg>,
     bin_off: Vec<u32>,
+    /// the bin index of every segment in `segs`, kept from the last
+    /// `build_bins` counting pass so a re-trace's permutation reuses them
+    bins: Vec<u32>,
+    /// the per-bin write cursor of the last permutation, retained with its
+    /// pages so a re-trace does not re-allocate it
+    bin_cur: Vec<u32>,
+    /// per-band segment arenas of the last parallel trace; retained (with
+    /// their pages) so a re-trace does not fault in fresh hundreds of
+    /// megabytes just to throw them away after the concatenation
+    band_bufs: Vec<Vec<Seg>>,
     /// reusable per-worker glow accumulators and the Geo pixels lit in the
     /// previous frame; both avoid full-grid work during sparse deposition
     glow: GlowCache,
@@ -1876,28 +1996,35 @@ impl GeoCache {
             mask: Vec::new(),
             segs: Vec::new(),
             bin_off: Vec::new(),
+            bins: Vec::new(),
+            bin_cur: Vec::new(),
+            band_bufs: Vec::new(),
             glow: GlowCache::new(),
             glow_was: false,
         }
+    }
+
+    /// Reserve every segment-side arena once, before the first frame. All
+    /// of these come out of the allocator as anonymous mmaps - free until
+    /// touched - so sizing them up front costs nothing now, guarantees the
+    /// (huge) reservation succeeds while the process is young, and keeps
+    /// the pages warm for every re-trace after that. `bins` holds one
+    /// `bin_of` result per segment; `bin_off` and `bin_cur` address the
+    /// fixed bin cube.
+    fn prime(&mut self, o: &Opt) {
+        let (w, h) = grid_size(o);
+        let cap = w * h * MAX_STEPS;
+        self.segs.reserve(cap);
+        self.bins.reserve(cap);
+        self.bin_off.reserve(BIN_N * BIN_N * BIN_N + 1);
+        self.bin_cur.reserve(BIN_N * BIN_N * BIN_N);
     }
 }
 
 #[inline]
 fn record_glow_segment(p0: V3, p1: V3, tr: f64, px: usize, segs: &mut Vec<Seg>) {
-    let sg = p1 - p0;
-    let dl = sg.len();
-    if dl <= 1e-12 {
-        return;
-    }
-    let rm = (p0 + sg * 0.5).len();
-    if rm < GLOW_R {
-        segs.push(Seg {
-            p0: [p0.x as f32, p0.y as f32, p0.z as f32],
-            sg: [sg.x as f32, sg.y as f32, sg.z as f32],
-            r: rm as f32,
-            tr: tr as f32,
-            px: px as u32,
-        });
+    if let Some(s) = Seg::from_endpoints(p0, p1, tr, px) {
+        segs.push(s);
     }
 }
 
@@ -1923,8 +2050,7 @@ fn trace_geo(
     let st = [0.0f64; 3]; // glow is deposited after the trace, not here
     let mut n = 0u8;
     let mut cr = [Cross {
-        x: 0.0,
-        z: 0.0,
+        phi: 0.0,
         om: 0.0,
         rr: 0.0,
         em: [0.0; 3],
@@ -1988,8 +2114,7 @@ fn trace_geo(
                         *e *= tr * graze;
                     }
                     cr[n as usize] = Cross {
-                        x: hp.x,
-                        z: hp.z,
+                        phi: hp.z.atan2(hp.x),
                         om,
                         rr,
                         em,
@@ -2058,7 +2183,7 @@ fn shade(g: &Geo, ctx: &ShCtx) -> [f64; 3] {
         // radius, Doppler and emission are unchanged and the turbulence phase
         // simply gains `orb`. The pattern itself lives in a pre-sampled
         // texture (see build_turb_tex).
-        let phi = c.z.atan2(c.x) + ctx.orb - ctx.t * c.om;
+        let phi = c.phi + ctx.orb - ctx.t * c.om;
         let streak = 0.42 + 1.25 * turb(phi, c.rr);
         col[0] += c.em[0] * streak;
         col[1] += c.em[1] * streak;
@@ -2749,12 +2874,22 @@ const RAY_BUDGET: usize = 200_000;
 
 /// Renders into `f`, reusing its pixel buffer between frames - a sixel frame
 /// is a 14 MB allocation and re-allocating it every frame shows.
-fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[Glow]) {
+/// The ray grid for the current options: `rays` caps how many of the
+/// terminal's sub-cells get traced, with a floor so tiny windows still fill
+/// the picture. Both the per-frame sizing and the one-off arena priming
+/// below share this, so the reservation can never disagree with what a
+/// frame actually needs.
+fn grid_size(o: &Opt) -> (usize, usize) {
     let s = (o.rays as f64 / (o.tpw as f64 * o.tph as f64))
         .min(1.0)
         .sqrt();
     let w = ((o.tpw as f64 * s).round() as usize).max(80);
     let h = ((o.tph as f64 * s).round() as usize).max(40);
+    (w, h)
+}
+
+fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[Glow]) {
+    let (w, h) = grid_size(o);
     f.w = w;
     f.h = h;
     // keep the previous frame's pixels: every shaded pixel is overwritten and
@@ -2816,13 +2951,27 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
         }
         let geo = &mut cache.geo;
         let mask = &mut cache.mask;
-        let mut segs: Vec<Seg> = Vec::new();
+        // The arena can hold every ray at its step budget; reserving that
+        // up front is free (untouched pages of the large allocation are
+        // never faulted in) and removes the repeated doubling copies a
+        // growing Vec of ten million segments otherwise pays. The arena -
+        // and the per-band arenas below - are taken out of the cache and
+        // put back, so a re-trace (zoom, tilt) reuses warm pages instead
+        // of faulting in fresh hundreds of megabytes every time.
+        let mut segs = std::mem::take(&mut cache.segs);
+        segs.clear();
+        segs.reserve(w * h * MAX_STEPS);
         if par {
             // each band collects the glow-lit path segments into its own
             // arena; concatenated in band order they arrive sorted by pixel,
             // which keeps the deposition pass cache-friendly
             let nband = h.div_ceil(rows_per);
-            let mut local: Vec<Vec<Seg>> = (0..nband).map(|_| Vec::new()).collect();
+            let mut local = std::mem::take(&mut cache.band_bufs);
+            local.resize_with(nband, Vec::new);
+            for buf in local.iter_mut() {
+                buf.clear();
+                buf.reserve(rows_per * w * MAX_STEPS);
+            }
             thread::scope(|sc| {
                 for (n, ((band, mband), slot)) in geo
                     .chunks_mut(rows_per * w)
@@ -2850,9 +2999,10 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
                     });
                 }
             });
-            for v in local {
-                segs.extend_from_slice(&v);
+            for v in local.iter() {
+                segs.extend_from_slice(v);
             }
+            cache.band_bufs = local;
         } else {
             for y in 0..h {
                 for x in 0..w {
@@ -2866,7 +3016,12 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
         // index the segment arena by position (in-place counting sort into
         // 1.2-unit cells): the per-frame glow pass then touches only the few
         // cells a glow can light instead of streaming the whole arena
-        build_bins(&mut segs, &mut cache.bin_off);
+        build_bins(
+            &mut segs,
+            &mut cache.bin_off,
+            &mut cache.bins,
+            &mut cache.bin_cur,
+        );
         cache.segs = segs;
     }
 
@@ -3211,11 +3366,14 @@ fn draw_braille(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
 
 /// Draw a quiet one-line status bar in the last terminal row. It deliberately
 /// has no background or inverse attribute, and uses a dim neutral grey so it
-/// does not compete with the scene.
-fn draw_status(o: &Opt, out: &mut String, t: f64, paused: bool) {
+/// does not compete with the scene. The measured frame rate leads the line
+/// in a lighter grey - the one number that changes every frame deserves the
+/// one bit of emphasis the bar has.
+fn draw_status(o: &Opt, out: &mut String, t: f64, paused: bool, fps: f64) {
     let state = if paused { " | paused" } else { "" };
+    let head = format!(" fps:{:.1}", fps);
     let text = format!(
-        " funnel:{} | speed:{:.2}x | zoom:{:.2} | tilt:{:+.1}° | orbit:{:+.1}°/s{} | t:{:.1}",
+        " | funnel:{} | speed:{:.2}x | zoom:{:.2} | tilt:{:+.1}° | orbit:{:+.1}°/s{} | t:{:.1}",
         o.funnel.name(),
         o.speed,
         o.zoom,
@@ -3225,15 +3383,23 @@ fn draw_status(o: &Opt, out: &mut String, t: f64, paused: bool) {
         t
     );
     let width = o.cols.max(1);
-    let visible: String = text.chars().take(width).collect();
+    let head_vis: String = head.chars().take(width).collect();
+    let tail_vis: String = text
+        .chars()
+        .take(width - head_vis.chars().count())
+        .collect();
     out.push_str("\x1b[");
     push_u32(out, o.rows.max(1) as u32);
     out.push_str(";1H");
     if o.color {
+        out.push_str("\x1b[38;2;168;168;168m");
+    }
+    out.push_str(&head_vis);
+    if o.color {
         out.push_str("\x1b[38;2;72;72;72m");
     }
-    out.push_str(&visible);
-    for _ in visible.chars().count()..width {
+    out.push_str(&tail_vis);
+    for _ in head_vis.chars().count() + tail_vis.chars().count()..width {
         out.push(' ');
     }
     if o.color {
@@ -3246,7 +3412,7 @@ fn draw_status(o: &Opt, out: &mut String, t: f64, paused: bool) {
 /// broken run-length compression in every band it touches.
 const SIXEL_SKY_CUT: f64 = 0.17;
 
-fn draw_sixel(o: &Opt, f: &Frame, out: &mut String, t: f64, paused: bool) {
+fn draw_sixel(o: &Opt, f: &Frame, out: &mut String, t: f64, paused: bool, fps: f64) {
     // Sixel paints device pixels, so map the ray grid up to the target size
     // (nearest neighbour) instead of drawing the picture a fifth of the
     // window wide. Reserve the last terminal row for the status line.
@@ -3360,7 +3526,7 @@ fn draw_sixel(o: &Opt, f: &Frame, out: &mut String, t: f64, paused: bool) {
         }
     }
     out.push_str("\x1b\\");
-    draw_status(o, out, t, paused);
+    draw_status(o, out, t, paused, fps);
 }
 
 /// 216-cube index of a colour (0..215)
@@ -3406,6 +3572,7 @@ fn main() {
             px: Vec::new(),
         };
         let mut cache = GeoCache::new();
+        cache.prime(&o);
         let mut stars = Stars::new();
         if o.super_star {
             stars.spawn_super(o.origin, o.azi, o.tilt, o.funnel);
@@ -3418,7 +3585,7 @@ fn main() {
         let glows = glow_list(&stars, o.azi);
         render_frame(&o, t, &mut f, &mut cache, &glows);
         let mut scr = Screen::new();
-        draw_into(&o, &f, &mut out, &mut scr, t, false);
+        draw_into(&o, &f, &mut out, &mut scr, t, false, o.fps);
         println!("{out}");
         return;
     }
@@ -3438,6 +3605,7 @@ fn main() {
         px: Vec::new(),
     };
     let mut cache = GeoCache::new();
+    cache.prime(&o);
     let mut stars = Stars::new();
     if o.super_star {
         stars.spawn_super(o.origin, o.azi, o.tilt, o.funnel);
@@ -3445,6 +3613,11 @@ fn main() {
         stars.spawn(o.big_star, &o);
     }
     let mut last = Instant::now();
+    // Measured frame rate of actually drawn frames, smoothed with an EMA so
+    // the status readout does not flicker. While paused nothing is produced,
+    // so the reading freezes; resuming re-arms it without counting the gap.
+    let mut fps = 0.0f64;
+    let mut last_draw: Option<Instant> = None;
     loop {
         let step = last.elapsed().as_secs_f64();
         last = Instant::now();
@@ -3458,21 +3631,36 @@ fn main() {
             render_frame(&o, t, &mut f, &mut cache, &glows);
             out.clear();
             out.push_str("\x1b[H");
-            draw_into(&o, &f, &mut out, &mut scr, t, paused);
+            draw_into(&o, &f, &mut out, &mut scr, t, paused, fps);
             let _ = so.write_all(out.as_bytes());
             let _ = so.flush();
+            let now = Instant::now();
+            if let Some(prev) = last_draw {
+                let dt = now.duration_since(prev).as_secs_f64();
+                if dt > 1e-9 {
+                    fps += (1.0 / dt - fps) * 0.2;
+                }
+            }
+            last_draw = Some(now);
             drawn = true;
         }
 
-        // frame pacing (also lets us stay responsive on slow terminals)
+        // frame pacing: sleep the remaining budget in one call. Keys are
+        // polled once per frame either way (see below), so coarse 1 ms
+        // sleep-polling here bought nothing - it just burned several
+        // milliseconds of CPU per frame waking up over and over.
         let budget = Duration::from_secs_f64(1.0 / o.fps);
-        while last.elapsed() < budget {
-            std::thread::sleep(Duration::from_millis(1));
+        let left = budget.saturating_sub(last.elapsed());
+        if !left.is_zero() {
+            std::thread::sleep(left);
         }
         if let Some(k) = poll_key() {
             match k {
                 Key::Esc | Key::Char('q') | Key::Char('c') => break,
-                Key::Char(' ') => paused = !paused,
+                Key::Char(' ') => {
+                    paused = !paused;
+                    last_draw = None;
+                }
                 Key::Char('+') | Key::Char('=') => {
                     o.zoom = (o.zoom * 1.15).clamp(0.25, 6.0);
                     drawn = false;
@@ -3533,17 +3721,25 @@ fn main() {
     let _ = so.flush();
 }
 
-fn draw_into(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen, t: f64, paused: bool) {
+fn draw_into(
+    o: &Opt,
+    f: &Frame,
+    out: &mut String,
+    scr: &mut Screen,
+    t: f64,
+    paused: bool,
+    fps: f64,
+) {
     match o.mode {
         Mode::Ascii => {
             draw_ascii(o, f, out, scr);
-            draw_status(o, out, t, paused);
+            draw_status(o, out, t, paused, fps);
         }
         Mode::Braille => {
             draw_braille(o, f, out, scr);
-            draw_status(o, out, t, paused);
+            draw_status(o, out, t, paused, fps);
         }
-        Mode::Sixel => draw_sixel(o, f, out, t, paused),
+        Mode::Sixel => draw_sixel(o, f, out, t, paused, fps),
     }
 }
 
@@ -3638,14 +3834,7 @@ mod tests {
         ];
         let erf_t = ERF_LUT.get_or_init(build_erf_lut);
         for (p0, p1, gp, sig) in cases {
-            let sg = p1 - p0;
-            let seg = Seg {
-                p0: [p0.x as f32, p0.y as f32, p0.z as f32],
-                sg: [sg.x as f32, sg.y as f32, sg.z as f32],
-                r: 0.0,
-                tr: 0.37,
-                px: 0,
-            };
+            let seg = Seg::from_endpoints(p0, p1, 0.37, 0).expect("test segment in range");
             let glow = Glow {
                 p: gp,
                 c: [1.0; 3],
@@ -3656,10 +3845,10 @@ mod tests {
             let mut numerical = 0.0;
             for i in 0..n {
                 let u = (i as f64 + 0.5) / n as f64;
-                let d = p0 + sg * u - glow.p;
+                let d = p0 + (p1 - p0) * u - glow.p;
                 numerical += (-d.len2() / (2.0 * glow.sig * glow.sig)).exp();
             }
-            numerical *= sg.len() / n as f64 * seg.tr as f64;
+            numerical *= (p1 - p0).len() / n as f64 * seg.tr as f64;
 
             let analytic = segment_glow_weight(&glow, &seg, erf_t);
             let error = (analytic - numerical).abs();
@@ -3689,9 +3878,10 @@ mod tests {
         let split = segs.windows(2).any(|pair| {
             let a = &pair[0];
             let b = &pair[1];
-            let ay = a.p0[1] as f64 + a.sg[1] as f64;
+            // segment a ends at its midpoint plus half its axis vector
+            let ay = a.m[1] as f64 + 0.5 * a.dl as f64 * a.u[1] as f64;
             ay.abs() < 1e-5
-                && (b.p0[1] as f64).abs() < 1e-5
+                && (b.m[1] as f64 - 0.5 * b.dl as f64 * b.u[1] as f64).abs() < 1e-5
                 && (b.tr as f64 - a.tr as f64 * DISK_OPA).abs() < 1e-6
         });
 
@@ -3720,17 +3910,15 @@ mod tests {
         for i in 0..120_000 {
             let p0 = v3(&mut rng);
             let p1 = p0 + v3(&mut rng) * 0.5;
-            let sg = p1 - p0;
-            segs.push(Seg {
-                p0: [p0.x as f32, p0.y as f32, p0.z as f32],
-                sg: [sg.x as f32, sg.y as f32, sg.z as f32],
-                r: ((p0 + sg * 0.5).len()) as f32,
-                tr: (0.2 + 0.8 * next(&mut rng)) as f32,
-                px: (i % 4096) as u32,
-            });
+            let tr = 0.2 + 0.8 * next(&mut rng);
+            if let Some(s) = Seg::from_endpoints(p0, p1, tr, i % 4096) {
+                segs.push(s);
+            }
         }
         let mut bin_off = Vec::new();
-        build_bins(&mut segs, &mut bin_off);
+        let mut bins = Vec::new();
+        let mut cur = Vec::new();
+        build_bins(&mut segs, &mut bin_off, &mut bins, &mut cur);
         let glows: Vec<Glow> = (0..40)
             .map(|_| Glow {
                 p: v3(&mut rng) * 0.8,

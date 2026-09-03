@@ -40,3 +40,24 @@ run_case plain
 run_case super-current --super-star --funnel current
 run_case super-tidal --super-star --funnel tidal
 run_case super-spiral --super-star --funnel spiral
+
+# Throughput companion: the paced runs above sleep to the fps budget for
+# most of their wall time and pay the one-off geodesic re-trace, so their
+# task-clock mostly measures idle and setup. This section renders flat out
+# (a budget no frame can hit) and counts actually drawn frames: the status
+# line carries " fps:" exactly once per rendered frame, so the achieved
+# frame rate can be measured from the outside.
+printf '\n== throughput (no pacing, warm caches) ==\n'
+for name_f in 'super-current|--super-star --funnel current' \
+              'super-tidal|--super-star --funnel tidal' \
+              'super-spiral|--super-star --funnel spiral'; do
+    name=${name_f%%|*}
+    flags=${name_f#*|}
+    # shellcheck disable=SC2086
+    frames=$(timeout "$SECONDS_TO_RUN" "$BIN" --mode "$MODE" --cols "$COLS" \
+        --rows "$ROWS" --rays "$RAYS" --fps 240 $flags 2>/dev/null | \
+        grep -a -o ' fps:' | wc -l)
+    awk -v n="$frames" -v t="$SECONDS_TO_RUN" \
+        'BEGIN { printf "%s: %d frames in %ss = %.1f fps (%.2f ms/frame)\n", \
+                 "'"$name"'", n, t, n / t, t * 1000 / (n > 0 ? n : 1) }'
+done
