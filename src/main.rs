@@ -721,7 +721,9 @@ const GLOW_R: f64 = BIG_R0.1 + 3.5 * INFALL_SIG * 3.0 + 0.06 * BIG_R0.1;
 /// and the tail cutoff work on), the unit axis `u`, the length `dl` and the
 /// midpoint's squared radius `r2` for the cheap radial pre-reject, the
 /// transmittance that was in effect when it was traced, and the pixel it
-/// belongs to. Everything a glow needs about the segment is already here, so
+/// belongs to. `sub` is the 4x4x4 fast-field cell, filled after binning, so
+/// the per-frame replay does not redo three coordinate divisions. Everything
+/// a glow needs about the segment is already here, so
 /// the hot deposition loop is pure arithmetic: no square root, no division,
 /// no re-derivation of the axis from the endpoints.
 ///
@@ -740,6 +742,7 @@ struct Seg {
     r2: f32,
     tr: f32,
     px: u32,
+    sub: u8,
 }
 
 impl Seg {
@@ -770,6 +773,7 @@ impl Seg {
             r2: (rm * rm) as f32,
             tr: tr as f32,
             px: px as u32,
+            sub: 0,
         })
     }
 }
@@ -906,12 +910,287 @@ fn segment_glow_midpoint(dm2: f64, inv2h: f64, s: &Seg) -> f64 {
     fast_exp_neg(dm2 * inv2h) * s.dl as f64 * s.tr as f64
 }
 
+/// Constants used while replaying one glow over the static segment arena.
+/// Keeping these separate from `Glow` makes the segment-centric hot loop
+/// independent of the per-frame setup work (radius, cutoff and reciprocals).
+#[derive(Clone, Copy)]
+struct GlowParams {
+    p: [f64; 3],
+    c: [f64; 3],
+    sig: f64,
+    inv: f64,
+    inv2h: f64,
+    inner2: f64,
+    outer2: f64,
+    reach2: f64,
+    range: isize,
+    fast: bool,
+}
+
+impl GlowParams {
+    fn new(gl: &Glow) -> GlowParams {
+        let gr = gl.p.len();
+        let rej = gl.sig * 3.5 + 0.06 * gr;
+        let peak = gl.c[0].max(gl.c[1]).max(gl.c[2]);
+        let cutoff = if peak < 1.0 {
+            GLOW_CUTOFF_DIM
+        } else {
+            GLOW_CUTOFF_BRIGHT
+        };
+        let inner = (gr - rej - 1e-4).max(0.0);
+        let outer = gr + rej + 1e-4;
+        let reach = cutoff * gl.sig + GLOW_SEG_HALF_MAX;
+        let inv = gl.sig.recip();
+        GlowParams {
+            p: [gl.p.x, gl.p.y, gl.p.z],
+            c: gl.c,
+            sig: gl.sig,
+            inv,
+            inv2h: inv * inv * 0.5,
+            inner2: inner * inner,
+            outer2: outer * outer,
+            reach2: reach * reach,
+            range: (rej / BIN_W).ceil() as isize + 1,
+            fast: gl.fast,
+        }
+    }
+}
+
+/// The exact finite-segment integral for the segment-centric deposition path.
+/// The midpoint offset and all glow constants are shared with the tail test,
+/// so the hot loop does not repeat setup work for a segment/glow pair.
+#[inline(always)]
+fn segment_glow_weight_params(
+    gl: &GlowParams,
+    s: &Seg,
+    erf_t: &[f32],
+    dmx: f64,
+    dmy: f64,
+    dmz: f64,
+) -> f64 {
+    let dm2 = dmx * dmx + dmy * dmy + dmz * dmz;
+    let q = dmx * s.u[0] as f64 + dmy * s.u[1] as f64 + dmz * s.u[2] as f64;
+    let perp2 = (dm2 - q * q).max(0.0);
+    let dl = s.dl as f64;
+    let along = q + 0.5 * dl;
+    let axial = axial_end(along * gl.inv, erf_t) + axial_end((dl - along) * gl.inv, erf_t);
+    fast_exp_neg(perp2 * gl.inv2h) * gl.sig * axial * s.tr as f64
+}
+
+/// Add a glow to every conservative bin its tail can reach. The bit mask is
+/// the key change from the old glow-major loop: a bin is visited once in the
+/// frame even when many stream glows overlap it.
+fn mark_glow_bins(gl: &GlowParams, bit: u64, bin_glows: &mut [u64], active_bins: &mut Vec<u32>) {
+    let cell = |v: f64| (((v / BIN_W).floor() as isize) + BIN_C).clamp(0, BIN_N as isize - 1);
+    let (gx, gy, gz) = (cell(gl.p[0]), cell(gl.p[1]), cell(gl.p[2]));
+    let last = BIN_N as isize - 1;
+
+    let axis_bounds = |i: isize| {
+        if i == 0 || i == last {
+            (0.0, GLOW_R * GLOW_R)
+        } else {
+            let lo = (i - BIN_C) as f64 * BIN_W;
+            let hi = lo + BIN_W;
+            let lo2 = lo * lo;
+            let hi2 = hi * hi;
+            let min2 = if lo <= 0.0 && hi >= 0.0 {
+                0.0
+            } else {
+                lo2.min(hi2)
+            };
+            (min2, lo2.max(hi2))
+        }
+    };
+    let point_axis_min = |i: isize, p: f64| {
+        if i == 0 || i == last {
+            0.0
+        } else {
+            let lo = (i - BIN_C) as f64 * BIN_W;
+            let hi = lo + BIN_W;
+            if p < lo {
+                (p - lo) * (p - lo)
+            } else if p > hi {
+                (p - hi) * (p - hi)
+            } else {
+                0.0
+            }
+        }
+    };
+    let mut xdist = [0.0; BIN_N];
+    let mut ydist = [0.0; BIN_N];
+    let mut zdist = [0.0; BIN_N];
+    for i in 0..BIN_N {
+        xdist[i] = point_axis_min(i as isize, gl.p[0]);
+        ydist[i] = point_axis_min(i as isize, gl.p[1]);
+        zdist[i] = point_axis_min(i as isize, gl.p[2]);
+    }
+
+    for z in (gz - gl.range).max(0)..=(gz + gl.range).min(last) {
+        let (zmin, zmax) = axis_bounds(z);
+        for y in (gy - gl.range).max(0)..=(gy + gl.range).min(last) {
+            let (ymin, ymax) = axis_bounds(y);
+            for x in (gx - gl.range).max(0)..=(gx + gl.range).min(last) {
+                if xdist[x as usize] + ydist[y as usize] + zdist[z as usize] > gl.reach2 {
+                    continue;
+                }
+                let (xmin, xmax) = axis_bounds(x);
+                if ymin + zmin + xmin > gl.outer2 || ymax + zmax + xmax < gl.inner2 {
+                    continue;
+                }
+                let b = (x + BIN_N as isize * (y + BIN_N as isize * z)) as usize;
+                if bin_glows[b] == 0 {
+                    active_bins.push(b as u32);
+                }
+                bin_glows[b] |= bit;
+            }
+        }
+    }
+}
+
+/// Evaluate all glows that can reach one segment. The segment is loaded once,
+/// and its pixel accumulator is updated once after all glow contributions have
+/// been summed. This removes the random pixel read/modify/write from the
+/// innermost glow loop.
+#[inline(always)]
+fn segment_glow_add(s: &Seg, mask: u64, glows: &[GlowParams], erf_t: &[f32]) -> [f64; 3] {
+    let r2 = s.r2 as f64;
+    let sx = s.m[0] as f64;
+    let sy = s.m[1] as f64;
+    let sz = s.m[2] as f64;
+    let mut bits = mask;
+    let mut add = [0.0; 3];
+    while bits != 0 {
+        let i = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        let gl = &glows[i];
+        if r2 < gl.inner2 || r2 > gl.outer2 {
+            continue;
+        }
+        let dmx = gl.p[0] - sx;
+        let dmy = gl.p[1] - sy;
+        let dmz = gl.p[2] - sz;
+        let dm2 = dmx * dmx + dmy * dmy + dmz * dmz;
+        if dm2 > gl.reach2 {
+            continue;
+        }
+        let e = if gl.fast {
+            segment_glow_midpoint(dm2, gl.inv2h, s)
+        } else {
+            segment_glow_weight_params(gl, s, erf_t, dmx, dmy, dmz)
+        };
+        add[0] += gl.c[0] * e;
+        add[1] += gl.c[1] * e;
+        add[2] += gl.c[2] * e;
+    }
+    add
+}
+
+/// Process a range of active spatial bins. Each segment belongs to exactly
+/// one bin, so partitioning bins gives workers disjoint input without locks.
+#[inline(always)]
+fn add_pixel(out: &mut [[f64; 3]], touched: &mut Vec<u32>, px: u32, add: [f64; 3]) {
+    if add == [0.0; 3] {
+        return;
+    }
+    let dst = &mut out[px as usize];
+    if *dst == [0.0; 3] {
+        touched.push(px);
+    }
+    dst[0] += add[0];
+    dst[1] += add[1];
+    dst[2] += add[2];
+}
+
+fn deposit_bin_range(
+    active_bins: &[u32],
+    begin: usize,
+    end: usize,
+    bin_field: &[u32],
+    bin_fast: &[[[f32; 3]; FAST_SUBCELLS]],
+    bin_exact: &[u64],
+    segs: &[Seg],
+    bin_off: &[u32],
+    glows: &[GlowParams],
+    erf_t: &[f32],
+    out: &mut [[f64; 3]],
+    touched: &mut Vec<u32>,
+) {
+    for &bin in &active_bins[begin..end] {
+        let b = bin as usize;
+        let field = &bin_fast[bin_field[b] as usize];
+        let exact = bin_exact[b];
+        for s in &segs[bin_off[b] as usize..bin_off[b + 1] as usize] {
+            let fast = field[s.sub as usize];
+            let scale = s.dl as f64 * s.tr as f64;
+            let mut add = [
+                fast[0] as f64 * scale,
+                fast[1] as f64 * scale,
+                fast[2] as f64 * scale,
+            ];
+            let glow = segment_glow_add(s, exact, glows, erf_t);
+            add[0] += glow[0];
+            add[1] += glow[1];
+            add[2] += glow[2];
+            add_pixel(out, touched, s.px, add);
+        }
+    }
+}
+
+#[inline(always)]
+fn fast_subcell(s: &Seg, b: usize) -> usize {
+    let bx = b % BIN_N;
+    let by = (b / BIN_N) % BIN_N;
+    let bz = b / (BIN_N * BIN_N);
+    let lo_x = (bx as isize - BIN_C) as f64 * BIN_W;
+    let lo_y = (by as isize - BIN_C) as f64 * BIN_W;
+    let lo_z = (bz as isize - BIN_C) as f64 * BIN_W;
+    let ix = (((s.m[0] as f64 - lo_x) / BIN_W * FAST_SUBDIV as f64) as usize).min(FAST_SUBDIV - 1);
+    let iy = (((s.m[1] as f64 - lo_y) / BIN_W * FAST_SUBDIV as f64) as usize).min(FAST_SUBDIV - 1);
+    let iz = (((s.m[2] as f64 - lo_z) / BIN_W * FAST_SUBDIV as f64) as usize).min(FAST_SUBDIV - 1);
+    ix + FAST_SUBDIV * iy + FAST_SUBDIV * FAST_SUBDIV * iz
+}
+
+/// Split active bins by segment count rather than by bin count. Photon-sphere
+/// bins are much denser than the outer bins, so equal bin ranges otherwise
+/// leave one worker with almost all of the frame's work.
+fn split_bin_work(active_bins: &[u32], bin_off: &[u32], workers: usize) -> Vec<(usize, usize)> {
+    let total: u64 = active_bins
+        .iter()
+        .map(|&b| (bin_off[b as usize + 1] - bin_off[b as usize]) as u64)
+        .sum();
+    let mut ranges = Vec::with_capacity(workers);
+    let mut begin = 0;
+    let mut remaining = total;
+    for worker in 0..workers {
+        if begin == active_bins.len() {
+            break;
+        }
+        let left = (workers - worker) as u64;
+        let target = (remaining + left - 1) / left;
+        let start = begin;
+        let mut work = 0u64;
+        while begin < active_bins.len() && (work < target || begin == start) {
+            let b = active_bins[begin] as usize;
+            work += (bin_off[b + 1] - bin_off[b]) as u64;
+            begin += 1;
+        }
+        ranges.push((start, begin));
+        remaining -= work;
+    }
+    ranges
+}
+
 /// Uniform bins over the cube of side BIN_N * BIN_W centred on the hole -
 /// the whole region any glow can light up, out past where the massive
 /// star spawns - so a glow only ever meets the segments physically near
 /// it instead of all of them.
 const BIN_N: usize = 75;
 const BIN_W: f64 = 1.2;
+/// Fast funnel fields are sampled on a small sub-grid inside each spatial bin.
+/// Four samples per axis keep the broad tidal glow smooth without evaluating
+/// one Gaussian for every traced segment.
+const FAST_SUBDIV: usize = 4;
+const FAST_SUBCELLS: usize = FAST_SUBDIV * FAST_SUBDIV * FAST_SUBDIV;
 /// the cube's centre: the bin index of the coordinate origin
 const BIN_C: isize = (BIN_N as isize) / 2;
 
@@ -960,6 +1239,14 @@ fn build_bins(segs: &mut [Seg], bin_off: &mut Vec<u32>, bins: &mut Vec<u32>, cur
             segs.swap(i, t);
             bins.swap(i, t);
             cur[b] += 1;
+        }
+    }
+    // This is an I-frame-only pass. Cache the fast-field subcell while the
+    // segment arena is already hot; P-frames can then select it with one byte
+    // load instead of recomputing three bin-local coordinate divisions.
+    for b in 0..bin_off.len() - 1 {
+        for s in &mut segs[bin_off[b] as usize..bin_off[b + 1] as usize] {
+            s.sub = fast_subcell(s, b) as u8;
         }
     }
 }
@@ -1141,6 +1428,23 @@ impl GlowBuf {
 }
 
 struct GlowCache {
+    /// Glow emission is kept separate from the large, mostly cold `Geo`
+    /// record. The deposition kernel writes this compact array at random
+    /// pixel indices, so it no longer drags the sky and crossing data into
+    /// cache for every segment contribution.
+    st: Vec<[f64; 3]>,
+    /// One bit per glow for every spatial bin. A segment can therefore find
+    /// all possible sources with one compact load.
+    bin_glows: Vec<u64>,
+    /// Sparse fast-field samples, indexed through `bin_field`. They are kept
+    /// only for active bins so the 75^3 query cube does not consume hundreds
+    /// of megabytes for empty cells.
+    bin_field: Vec<u32>,
+    bin_fast: Vec<[[f32; 3]; FAST_SUBCELLS]>,
+    /// Exact stellar glow mask for each bin; funnel glows are represented by
+    /// the sampled fast field above.
+    bin_exact: Vec<u64>,
+    active_bins: Vec<u32>,
     bufs: Vec<GlowBuf>,
     /// Pixels lit by the current deposition.
     lit: Vec<u32>,
@@ -1154,6 +1458,12 @@ struct GlowCache {
 impl GlowCache {
     fn new() -> GlowCache {
         GlowCache {
+            st: Vec::new(),
+            bin_glows: Vec::new(),
+            bin_field: Vec::new(),
+            bin_fast: Vec::new(),
+            bin_exact: Vec::new(),
+            active_bins: Vec::new(),
             bufs: Vec::new(),
             lit: Vec::new(),
             previous_lit: Vec::new(),
@@ -1172,101 +1482,260 @@ const GLOW_BUF_BUDGET: usize = 32 * 1024 * 1024;
 /// their dense accumulation buffers between frames, but reduce and clear only
 /// pixels they actually touched. `lit` similarly identifies the Geo entries
 /// that need clearing at the beginning of the next glow frame.
-fn deposit_glows(
+/// Deposit one <=64-glow chunk with a bin-major traversal. The old path was
+/// glow-major: the same dense photon-sphere bin was streamed once per glow.
+/// Here a segment is loaded once, the bin's glow bitmask selects its sources,
+/// and the compact pixel accumulator is updated once.
+fn deposit_glow_chunk(
     segs: &[Seg],
     bin_off: &[u32],
     glows: &[Glow],
-    geo: &mut [Geo],
+    grid_len: usize,
     cache: &mut GlowCache,
     par: bool,
     nthreads: usize,
 ) {
-    // Clear the previous glow, but retain its coordinates until after this
-    // frame is shaded: those pixels must be redrawn once without the glow.
-    cache.previous_lit.clear();
-    cache.previous_lit.append(&mut cache.lit);
-    if cache.mask.len() != geo.len() {
-        cache.mask.clear();
-        cache.mask.resize(geo.len(), false);
+    debug_assert!(glows.len() <= u64::BITS as usize);
+    let bin_len = bin_off.len().saturating_sub(1);
+    if cache.bin_glows.len() != bin_len {
+        cache.bin_glows.resize(bin_len, 0);
     }
-    for &px in &cache.previous_lit {
-        geo[px as usize].st = [0.0; 3];
-        cache.mask[px as usize] = true;
+    // The masks are sparse in practice. Clear only the bins used by the
+    // preceding chunk/frame instead of streaming the whole 421k-bin array.
+    for i in 0..cache.active_bins.len() {
+        let b = cache.active_bins[i] as usize;
+        cache.bin_glows[b] = 0;
+        if b < cache.bin_field.len() {
+            cache.bin_field[b] = u32::MAX;
+            cache.bin_exact[b] = 0;
+        }
     }
-    if glows.is_empty() || segs.is_empty() {
+    cache.active_bins.clear();
+    cache.bin_fast.clear();
+
+    let params_storage: Vec<GlowParams> = glows.iter().map(GlowParams::new).collect();
+    let params: &[GlowParams] = &params_storage;
+    for (i, gl) in params.iter().enumerate() {
+        mark_glow_bins(gl, 1u64 << i, &mut cache.bin_glows, &mut cache.active_bins);
+    }
+    // `mark_glow_bins` is deliberately conservative and also marks empty
+    // bins. Removing those here keeps the work splitter focused on real
+    // segments without changing the set of accepted contributions.
+    cache.active_bins.retain(|&b| {
+        let b = b as usize;
+        bin_off[b] < bin_off[b + 1]
+    });
+    if cache.active_bins.is_empty() {
         return;
     }
-    if cache.grid_len != geo.len() {
+
+    if cache.bin_field.len() != bin_len {
+        cache.bin_field.resize(bin_len, u32::MAX);
+    }
+    if cache.bin_exact.len() != bin_len {
+        cache.bin_exact.resize(bin_len, 0);
+    }
+    // Funnel groups are broad, low-contrast midpoint primitives. Accumulate
+    // their Gaussian field at a 4x4x4 sub-grid for each active bin. The
+    // expensive source evaluation is consequently paid once per bin/source,
+    // not once per traced segment/source pair. Stellar glows remain exact.
+    for &bin in &cache.active_bins {
+        let b = bin as usize;
+        let mut bits = cache.bin_glows[b];
+        let bx = b % BIN_N;
+        let by = (b / BIN_N) % BIN_N;
+        let bz = b / (BIN_N * BIN_N);
+        let lo = [
+            (bx as isize - BIN_C) as f64 * BIN_W,
+            (by as isize - BIN_C) as f64 * BIN_W,
+            (bz as isize - BIN_C) as f64 * BIN_W,
+        ];
+        let mut field = [[0.0f32; 3]; FAST_SUBCELLS];
+        let mut exact = 0u64;
+        while bits != 0 {
+            let i = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let gl = &params[i];
+            if !gl.fast {
+                exact |= 1u64 << i;
+                continue;
+            }
+            for z in 0..FAST_SUBDIV {
+                for y in 0..FAST_SUBDIV {
+                    for x in 0..FAST_SUBDIV {
+                        let sample = [
+                            lo[0] + (x as f64 + 0.5) * BIN_W / FAST_SUBDIV as f64,
+                            lo[1] + (y as f64 + 0.5) * BIN_W / FAST_SUBDIV as f64,
+                            lo[2] + (z as f64 + 0.5) * BIN_W / FAST_SUBDIV as f64,
+                        ];
+                        let dx = gl.p[0] - sample[0];
+                        let dy = gl.p[1] - sample[1];
+                        let dz = gl.p[2] - sample[2];
+                        let dm2 = dx * dx + dy * dy + dz * dz;
+                        if dm2 <= gl.reach2 {
+                            let e = fast_exp_neg(dm2 * gl.inv2h) as f32;
+                            let k = x + FAST_SUBDIV * y + FAST_SUBDIV * FAST_SUBDIV * z;
+                            field[k][0] += gl.c[0] as f32 * e;
+                            field[k][1] += gl.c[1] as f32 * e;
+                            field[k][2] += gl.c[2] as f32 * e;
+                        }
+                    }
+                }
+            }
+        }
+        let field_index = cache.bin_fast.len() as u32;
+        cache.bin_field[b] = field_index;
+        cache.bin_exact[b] = exact;
+        cache.bin_fast.push(field);
+    }
+
+    if cache.grid_len != grid_len {
         // A size change is an I-frame event, so release all old worker
         // capacities once instead of letting several grid sizes accumulate.
         cache.bufs.clear();
-        cache.grid_len = geo.len();
+        cache.grid_len = grid_len;
     }
-    let bytes_per_buf = geo
-        .len()
+    let bytes_per_buf = grid_len
         .saturating_mul(std::mem::size_of::<[f64; 3]>())
         .max(1);
     let memory_workers = (GLOW_BUF_BUDGET / bytes_per_buf).max(1);
     let nt = if par {
-        nthreads.min(glows.len()).min(memory_workers)
+        nthreads.min(memory_workers).min(cache.active_bins.len())
     } else {
         1
     };
+    let erf_t = ERF_LUT.get_or_init(build_erf_lut);
+
     if nt <= 1 {
-        for gl in glows {
-            deposit_one(gl, segs, bin_off, &mut |px, add| {
-                let g = &mut geo[px];
-                if g.st == [0.0; 3] {
-                    cache.lit.push(px as u32);
-                }
-                g.st[0] += add[0];
-                g.st[1] += add[1];
-                g.st[2] += add[2];
-            });
-        }
+        let active_bins = &cache.active_bins;
+        let bin_field = &cache.bin_field;
+        let bin_fast = &cache.bin_fast;
+        let bin_exact = &cache.bin_exact;
+        let st = &mut cache.st;
+        let lit = &mut cache.lit;
+        deposit_bin_range(
+            active_bins,
+            0,
+            active_bins.len(),
+            bin_field,
+            bin_fast,
+            bin_exact,
+            segs,
+            bin_off,
+            params,
+            erf_t,
+            st,
+            lit,
+        );
     } else {
         while cache.bufs.len() < nt {
             cache.bufs.push(GlowBuf::new());
         }
         for buf in cache.bufs.iter_mut().take(nt) {
-            buf.resize(geo.len());
+            buf.resize(grid_len);
         }
+        let ranges = split_bin_work(&cache.active_bins, bin_off, nt);
+        let active_bins = &cache.active_bins;
+        let bin_field = &cache.bin_field;
+        let bin_fast = &cache.bin_fast;
+        let bin_exact = &cache.bin_exact;
+        let bufs = &mut cache.bufs;
         std::thread::scope(|sc| {
-            for (chunk, buf) in glows
-                .chunks(glows.len().div_ceil(nt))
-                .zip(cache.bufs.iter_mut().take(nt))
-            {
+            for ((begin, end), buf) in ranges.iter().copied().zip(bufs.iter_mut().take(nt)) {
                 sc.spawn(move || {
-                    for gl in chunk {
-                        deposit_one(gl, segs, bin_off, &mut |px, add| {
-                            let dst = &mut buf.px[px];
-                            if *dst == [0.0; 3] {
-                                buf.touched.push(px as u32);
-                            }
-                            dst[0] += add[0];
-                            dst[1] += add[1];
-                            dst[2] += add[2];
-                        });
-                    }
+                    deposit_bin_range(
+                        active_bins,
+                        begin,
+                        end,
+                        bin_field,
+                        bin_fast,
+                        bin_exact,
+                        segs,
+                        bin_off,
+                        params,
+                        erf_t,
+                        &mut buf.px,
+                        &mut buf.touched,
+                    );
                 });
             }
         });
-        // Worker order matches glow-chunk order, exactly as in the previous
-        // full-buffer reduction. This preserves floating-point association.
-        for buf in cache.bufs.iter_mut().take(nt) {
+        // Reduction remains deterministic in worker/range order. The sum is
+        // mathematically identical to the old glow-major accumulation; only
+        // floating-point association inside a pixel changes before the final
+        // display quantisation.
+        for buf in cache.bufs.iter_mut().take(ranges.len()) {
             for px in buf.touched.drain(..) {
                 let px = px as usize;
                 let add = buf.px[px];
                 buf.px[px] = [0.0; 3];
-                let g = &mut geo[px];
-                if g.st == [0.0; 3] {
+                let dst = &mut cache.st[px];
+                if *dst == [0.0; 3] {
                     cache.lit.push(px as u32);
                 }
-                g.st[0] += add[0];
-                g.st[1] += add[1];
-                g.st[2] += add[2];
+                dst[0] += add[0];
+                dst[1] += add[1];
+                dst[2] += add[2];
             }
         }
+    }
+
+    for i in 0..cache.active_bins.len() {
+        let b = cache.active_bins[i] as usize;
+        cache.bin_glows[b] = 0;
+        cache.bin_field[b] = u32::MAX;
+        cache.bin_exact[b] = 0;
+    }
+    cache.bin_fast.clear();
+    cache.active_bins.clear();
+}
+
+/// Lay the frame's glows over the cached geometry. Previous glow pixels are
+/// cleared first, then all current sources are deposited through one
+/// bin-major pass. The compact `GlowCache::st` keeps this random-write path
+/// out of the large cold geometry records.
+fn deposit_glows(
+    segs: &[Seg],
+    bin_off: &[u32],
+    glows: &[Glow],
+    grid_len: usize,
+    cache: &mut GlowCache,
+    par: bool,
+    nthreads: usize,
+) {
+    if cache.st.len() != grid_len {
+        cache.st = vec![[0.0; 3]; grid_len];
+        cache.lit.clear();
+        cache.previous_lit.clear();
+        cache.mask.clear();
+    }
+    if cache.mask.len() != grid_len {
+        cache.mask.clear();
+        cache.mask.resize(grid_len, false);
+    }
+
+    // Clear the previous glow, but retain its coordinates until after this
+    // frame is shaded: those pixels must be redrawn once without the glow.
+    cache.previous_lit.clear();
+    cache.previous_lit.append(&mut cache.lit);
+    for &px in &cache.previous_lit {
+        cache.st[px as usize] = [0.0; 3];
+        cache.mask[px as usize] = true;
+    }
+    if glows.is_empty() || segs.is_empty() {
+        return;
+    }
+    if cache.grid_len != grid_len {
+        cache.bufs.clear();
+        cache.grid_len = grid_len;
+    }
+
+    // The current application has fewer than 64 glow primitives (even with
+    // three ordinary stars). Chunking keeps the representation safe if a
+    // future profile exceeds that limit, at the cost of another bin pass only
+    // in that unusual case.
+    for chunk in glows.chunks(u64::BITS as usize) {
+        deposit_glow_chunk(segs, bin_off, chunk, grid_len, cache, par, nthreads);
     }
 }
 
@@ -1926,18 +2395,15 @@ struct Geo {
     esc: V3,
     n: u8,
     cr: [Cross; 3],
-    /// emission deposited by the infalling star's glow along this ray
-    st: [f64; 3],
 }
 
 impl Geo {
     /// A pixel that cannot change while the camera holds still: no disk
     /// crossings and no star to twinkle (the band is static). Its value from
     /// the previous frame is still correct, so shading can skip it entirely.
+    /// Glow state is kept in the compact side buffer, not in this cold record.
     fn is_static(&self) -> bool {
-        self.n == 0
-            && self.st == [0.0, 0.0, 0.0]
-            && !self.sky.is_some_and(|s| s.star != [0.0, 0.0, 0.0])
+        self.n == 0 && !self.sky.is_some_and(|s| s.star != [0.0, 0.0, 0.0])
     }
 
     fn empty() -> Geo {
@@ -1951,7 +2417,6 @@ impl Geo {
                 rr: 0.0,
                 em: [0.0; 3],
             }; 3],
-            st: [0.0; 3],
         }
     }
 }
@@ -2047,7 +2512,6 @@ fn trace_geo(
     let h2 = p.cross(v).len2();
     let mut a = accel(p, h2);
     let mut tr = 1.0f64; // remaining transmittance
-    let st = [0.0f64; 3]; // glow is deposited after the trace, not here
     let mut n = 0u8;
     let mut cr = [Cross {
         phi: 0.0,
@@ -2065,7 +2529,6 @@ fn trace_geo(
                 esc: V3::new(0.0, 0.0, 0.0),
                 n,
                 cr,
-                st,
             };
             return;
         }
@@ -2076,7 +2539,6 @@ fn trace_geo(
                 esc,
                 n,
                 cr,
-                st,
             };
             return;
         }
@@ -2143,7 +2605,6 @@ fn trace_geo(
         esc: V3::new(0.0, 0.0, 0.0),
         n,
         cr,
-        st,
     };
 }
 
@@ -2174,7 +2635,7 @@ struct ShCtx {
 /// Emission of one pixel at time `t` from cached geometry. This is all an
 /// animation frame pays for once the geodesics are traced: one sine per sky
 /// pixel, one noise lookup per disk crossing.
-fn shade(g: &Geo, ctx: &ShCtx) -> [f64; 3] {
+fn shade(g: &Geo, st: &[f64; 3], ctx: &ShCtx) -> [f64; 3] {
     let mut col = [0.0f64; 3]; // HDR disk light, tone mapped at the end
     for i in 0..g.n as usize {
         let c = &g.cr[i];
@@ -2212,8 +2673,8 @@ fn shade(g: &Geo, ctx: &ShCtx) -> [f64; 3] {
     // the infalling star's glow is steady; the funnel animation comes from
     // moving parcels and changing mass, not an artificial brightness pulse
     let mut gl = [0.0f64; 3];
-    if g.st != [0.0, 0.0, 0.0] {
-        gl = [softclip(g.st[0]), softclip(g.st[1]), softclip(g.st[2])];
+    if *st != [0.0, 0.0, 0.0] {
+        gl = [softclip(st[0]), softclip(st[1]), softclip(st[2])];
     }
     [
         (c[0] + bg[0] + gl[0]).clamp(0.0, 1.0),
@@ -2941,6 +3402,9 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
         cache.glow.lit.clear();
         cache.glow.previous_lit.clear();
         cache.glow.mask.clear();
+        // The geometry is being replaced, so the side-buffered glow values
+        // no longer belong to these pixels even when the grid size is stable.
+        cache.glow.st.clear();
         // same reuse story as the pixel buffer: a stable-size re-trace (zoom)
         // overwrites every entry anyway
         if cache.geo.len() != w * h {
@@ -3038,7 +3502,7 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
             &cache.segs,
             &cache.bin_off,
             glows,
-            &mut cache.geo,
+            cache.geo.len(),
             &mut cache.glow,
             par,
             nthreads,
@@ -3084,47 +3548,52 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
     }
     let geo = &cache.geo;
     let glow_mask = &cache.glow.mask;
+    let glow_st = &cache.glow.st;
     if par {
         thread::scope(|sc| {
-            for (n, ((band, mband), gmband)) in px
+            for (n, (((band, mband), gmband), stband)) in px
                 .chunks_mut(rows_per * w)
                 .zip(cache.mask.chunks(rows_per * w))
                 .zip(glow_mask.chunks(rows_per * w))
+                .zip(glow_st.chunks(rows_per * w))
                 .enumerate()
             {
                 let src = &geo[n * rows_per * w..];
                 let ctx = &ctx;
                 sc.spawn(move || {
                     if skip_static {
-                        for (((p, m), gm), g) in band.iter_mut().zip(mband).zip(gmband).zip(src) {
+                        for ((((p, m), gm), g), st) in
+                            band.iter_mut().zip(mband).zip(gmband).zip(src).zip(stband)
+                        {
                             if !(*m || *gm) {
                                 continue;
                             }
-                            *p = shade(g, ctx);
+                            *p = shade(g, st, ctx);
                         }
                     } else {
-                        for (p, g) in band.iter_mut().zip(src) {
-                            *p = shade(g, ctx);
+                        for ((p, g), st) in band.iter_mut().zip(src).zip(stband) {
+                            *p = shade(g, st, ctx);
                         }
                     }
                 });
             }
         });
     } else if skip_static {
-        for (((p, m), gm), g) in px
+        for ((((p, m), gm), g), st) in px
             .iter_mut()
             .zip(cache.mask.iter())
             .zip(glow_mask.iter())
             .zip(geo.iter())
+            .zip(glow_st.iter())
         {
             if !(*m || *gm) {
                 continue;
             }
-            *p = shade(g, &ctx);
+            *p = shade(g, st, &ctx);
         }
     } else {
-        for (p, g) in px.iter_mut().zip(geo.iter()) {
-            *p = shade(g, &ctx);
+        for ((p, g), st) in px.iter_mut().zip(geo.iter()).zip(glow_st.iter()) {
+            *p = shade(g, st, &ctx);
         }
     }
 
@@ -3795,14 +4264,13 @@ mod tests {
 
     #[test]
     fn empty_glow_frame_clears_previous_deposition() {
-        let mut geo = vec![Geo::empty()];
-        geo[0].st = [1.0, 0.5, 0.25];
         let mut cache = GlowCache::new();
+        cache.st = vec![[1.0, 0.5, 0.25]];
         cache.lit.push(0);
 
-        deposit_glows(&[], &[], &[], &mut geo, &mut cache, false, 1);
+        deposit_glows(&[], &[], &[], 1, &mut cache, false, 1);
 
-        assert_eq!(geo[0].st, [0.0; 3]);
+        assert_eq!(cache.st[0], [0.0; 3]);
         assert!(cache.lit.is_empty());
     }
 
@@ -4079,7 +4547,7 @@ mod tests {
             *channel = channel.clamp(0.0, 1.0);
         }
 
-        assert_eq!(shade(&geo, &ctx), expected);
+        assert_eq!(shade(&geo, &[0.0; 3], &ctx), expected);
     }
 
     #[test]
