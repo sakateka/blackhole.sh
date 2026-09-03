@@ -789,6 +789,34 @@ const ERF_N: usize = 2048;
 const ERF_X: f64 = 7.0; // erf(7/sqrt 2) = 1 - 2e-12: saturated
 static ERF_LUT: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
 
+/// The field setup evaluates the same positive Gaussian exponent at every
+/// active bin/source/subcell. A small linear table is faster than rebuilding
+/// the degree-six exp polynomial for each setup sample; the stored f32 field
+/// is already much coarser than this interpolation error.
+const FAST_EXP_N: usize = 8192;
+const FAST_EXP_X: f64 = 12.0;
+static FAST_EXP_LUT: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+
+fn build_fast_exp_lut() -> Vec<f32> {
+    (0..=FAST_EXP_N)
+        .map(|i| (-(i as f64 * FAST_EXP_X / FAST_EXP_N as f64)).exp() as f32)
+        .collect()
+}
+
+#[inline(always)]
+fn fast_exp_lut(x: f64, table: &[f32]) -> f32 {
+    if x <= 0.0 {
+        return 1.0;
+    }
+    if x >= FAST_EXP_X {
+        return 0.0;
+    }
+    let f = x * FAST_EXP_N as f64 / FAST_EXP_X;
+    let i = f as usize;
+    let lo = table[i];
+    lo + (table[i + 1] - lo) * (f - i as f64) as f32
+}
+
 fn erf_approx(x: f64) -> f64 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
@@ -879,6 +907,7 @@ fn segment_glow_weight(gl: &Glow, s: &Seg, erf_t: &[f32]) -> f64 {
 /// The exact line integral above, with the per-glow constants and the
 /// midpoint offset already computed by the caller (the tail cutoff needs
 /// the same products, so nothing is evaluated twice).
+#[cfg(test)]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn segment_glow_weight_at(
@@ -1088,19 +1117,65 @@ fn segment_glow_add(s: &Seg, mask: u64, glows: &[GlowParams], erf_t: &[f32]) -> 
 /// Process a range of active spatial bins. Each segment belongs to exactly
 /// one bin, so partitioning bins gives workers disjoint input without locks.
 #[inline(always)]
-fn add_pixel(out: &mut [[f64; 3]], touched: &mut Vec<u32>, px: u32, add: [f64; 3]) {
+fn add_fast_pixel(buf: &mut GlowBuf, px: u32, add: [f32; 3]) {
+    // Fast field values are non-negative. Do not maintain a touched list for
+    // this dense path; the reduction scans the small output grid once, which
+    // is cheaper than a branch and push for every path segment.
+    // SAFETY: `px` is copied from a traced segment and every segment is
+    // created for a pixel in the current ray grid.
+    let dst = unsafe { buf.fast_px.get_unchecked_mut(px as usize) };
+    dst[0] += add[0];
+    dst[1] += add[1];
+    dst[2] += add[2];
+}
+
+#[inline(always)]
+fn add_exact_pixel(buf: &mut GlowBuf, px: u32, add: [f64; 3]) {
     if add == [0.0; 3] {
         return;
     }
-    let dst = &mut out[px as usize];
+    let dst = &mut buf.px[px as usize];
     if *dst == [0.0; 3] {
-        touched.push(px);
+        buf.touched.push(px);
     }
     dst[0] += add[0];
     dst[1] += add[1];
     dst[2] += add[2];
 }
 
+/// Merge one worker's fast f32 field and exact f64 stellar field into the
+/// frame buffer. Keeping the two formats separate makes the hot funnel loop
+/// cheap without weakening the exact source kernel's accumulation.
+fn reduce_glow_buf(buf: &mut GlowBuf, st: &mut [[f64; 3]], lit: &mut Vec<u32>) {
+    for (i, slot) in buf.fast_px.iter_mut().enumerate() {
+        let add = *slot;
+        *slot = [0.0; 3];
+        if add == [0.0; 3] {
+            continue;
+        }
+        let dst = &mut st[i];
+        if *dst == [0.0; 3] {
+            lit.push(i as u32);
+        }
+        dst[0] += add[0] as f64;
+        dst[1] += add[1] as f64;
+        dst[2] += add[2] as f64;
+    }
+    for px in buf.touched.drain(..) {
+        let i = px as usize;
+        let add = buf.px[i];
+        buf.px[i] = [0.0; 3];
+        let dst = &mut st[i];
+        if *dst == [0.0; 3] {
+            lit.push(px);
+        }
+        dst[0] += add[0];
+        dst[1] += add[1];
+        dst[2] += add[2];
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn deposit_bin_range(
     active_bins: &[u32],
     begin: usize,
@@ -1108,30 +1183,57 @@ fn deposit_bin_range(
     bin_field: &[u32],
     bin_fast: &[[[f32; 3]; FAST_SUBCELLS]],
     bin_exact: &[u64],
+    fast_segs: &[FastSeg],
+    fast_off: &[u32],
     segs: &[Seg],
     bin_off: &[u32],
     glows: &[GlowParams],
     erf_t: &[f32],
-    out: &mut [[f64; 3]],
-    touched: &mut Vec<u32>,
+    buf: &mut GlowBuf,
 ) {
     for &bin in &active_bins[begin..end] {
         let b = bin as usize;
-        let field = &bin_fast[bin_field[b] as usize];
         let exact = bin_exact[b];
-        for s in &segs[bin_off[b] as usize..bin_off[b + 1] as usize] {
-            let fast = field[s.sub as usize];
-            let scale = s.dl as f64 * s.tr as f64;
-            let mut add = [
-                fast[0] as f64 * scale,
-                fast[1] as f64 * scale,
-                fast[2] as f64 * scale,
-            ];
-            let glow = segment_glow_add(s, exact, glows, erf_t);
-            add[0] += glow[0];
-            add[1] += glow[1];
-            add[2] += glow[2];
-            add_pixel(out, touched, s.px, add);
+        if bin_field[b] != u32::MAX {
+            let field = &bin_fast[bin_field[b] as usize];
+            if fast_off.len() == bin_off.len() {
+                // The compact arena keeps the full segment records out of
+                // the hot funnel pass. Stellar bins still replay their exact
+                // source against the cold records below.
+                for fs in &fast_segs[fast_off[b] as usize..fast_off[b + 1] as usize] {
+                    // SAFETY: `sub` is assigned by `fast_subcell`, whose
+                    // range is exactly FAST_SUBCELLS.
+                    let fast = unsafe { field.get_unchecked(fs.sub as usize) };
+                    add_fast_pixel(
+                        buf,
+                        fs.px,
+                        [
+                            fast[0] * fs.weight,
+                            fast[1] * fs.weight,
+                            fast[2] * fs.weight,
+                        ],
+                    );
+                }
+            } else {
+                // No compact arena is needed for a stellar-only scene, but
+                // retain this fallback for a fast glow on its first frame.
+                for s in &segs[bin_off[b] as usize..bin_off[b + 1] as usize] {
+                    // SAFETY: `sub` is assigned by `fast_subcell`, whose
+                    // range is exactly FAST_SUBCELLS.
+                    let fast = unsafe { field.get_unchecked(s.sub as usize) };
+                    let scale = s.dl * s.tr;
+                    add_fast_pixel(
+                        buf,
+                        s.px,
+                        [fast[0] * scale, fast[1] * scale, fast[2] * scale],
+                    );
+                }
+            }
+        }
+        if exact != 0 {
+            for s in &segs[bin_off[b] as usize..bin_off[b + 1] as usize] {
+                add_exact_pixel(buf, s.px, segment_glow_add(s, exact, glows, erf_t));
+            }
         }
     }
 }
@@ -1166,7 +1268,7 @@ fn split_bin_work(active_bins: &[u32], bin_off: &[u32], workers: usize) -> Vec<(
             break;
         }
         let left = (workers - worker) as u64;
-        let target = (remaining + left - 1) / left;
+        let target = remaining.div_ceil(left);
         let start = begin;
         let mut work = 0u64;
         while begin < active_bins.len() && (work < target || begin == start) {
@@ -1251,11 +1353,32 @@ fn build_bins(segs: &mut [Seg], bin_off: &mut Vec<u32>, bins: &mut Vec<u32>, cur
     }
 }
 
+/// Copy only the metadata needed by the fast funnel replay into a compact,
+/// bin-aligned arena. The full segment records stay cold and are touched only
+/// by bins containing exact stellar glows.
+fn build_fast_arena(segs: &[Seg], bin_off: &[u32], out: &mut Vec<FastSeg>, off: &mut Vec<u32>) {
+    out.clear();
+    off.clear();
+    off.reserve(bin_off.len());
+    off.push(0);
+    for b in 0..bin_off.len() - 1 {
+        for s in &segs[bin_off[b] as usize..bin_off[b + 1] as usize] {
+            out.push(FastSeg {
+                px: s.px,
+                weight: s.dl * s.tr,
+                sub: s.sub,
+            });
+        }
+        off.push(out.len() as u32);
+    }
+}
+
 /// Add one glow's light to `out`, indexed by pixel. This is the same sum the
 /// trace used to carry inline - radial pre-reject and the gaussian line
 /// integral with transmittance - but only over
 /// the bins within the glow's reach, a few thousand segments instead of
 /// every segment tested against every glow.
+#[cfg(test)]
 fn deposit_one_impl<F, const FAST: bool>(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut F)
 where
     F: FnMut(usize, [f64; 3]),
@@ -1391,6 +1514,7 @@ where
 /// Dispatch once per glow, so the hot segment loop is monomorphized: funnel
 /// groups contain no branch or axial-integral work, while stellar glows keep
 /// the exact path.
+#[cfg(test)]
 #[inline]
 fn deposit_one<F>(gl: &Glow, segs: &[Seg], bin_off: &[u32], out: &mut F)
 where
@@ -1403,12 +1527,23 @@ where
     }
 }
 
+#[derive(Clone, Copy)]
+struct FastSeg {
+    px: u32,
+    weight: f32,
+    sub: u8,
+}
+
 /// Per-worker glow accumulation. `px` is dense so updates need no hashing;
 /// `touched` makes clearing and reduction proportional to the number of lit
 /// pixels rather than the size of the entire ray grid.
 struct GlowBuf {
+    /// Exact stellar contributions retain f64 accumulation.
     px: Vec<[f64; 3]>,
     touched: Vec<u32>,
+    /// The sampled funnel field is already f32; keeping its worker buffer in
+    /// the same format avoids widening every segment's three multiplies.
+    fast_px: Vec<[f32; 3]>,
 }
 
 impl GlowBuf {
@@ -1416,12 +1551,14 @@ impl GlowBuf {
         GlowBuf {
             px: Vec::new(),
             touched: Vec::new(),
+            fast_px: Vec::new(),
         }
     }
 
     fn resize(&mut self, len: usize) {
         if self.px.len() != len {
             self.px = vec![[0.0; 3]; len];
+            self.fast_px = vec![[0.0; 3]; len];
             self.touched.clear();
         }
     }
@@ -1444,6 +1581,11 @@ struct GlowCache {
     /// Exact stellar glow mask for each bin; funnel glows are represented by
     /// the sampled fast field above.
     bin_exact: Vec<u64>,
+    /// Compact hot-path copy of the segment metadata needed by the sampled
+    /// funnel field. The full `Seg` arena remains available only for exact
+    /// stellar bins.
+    fast_segs: Vec<FastSeg>,
+    fast_off: Vec<u32>,
     active_bins: Vec<u32>,
     bufs: Vec<GlowBuf>,
     /// Pixels lit by the current deposition.
@@ -1463,6 +1605,8 @@ impl GlowCache {
             bin_field: Vec::new(),
             bin_fast: Vec::new(),
             bin_exact: Vec::new(),
+            fast_segs: Vec::new(),
+            fast_off: Vec::new(),
             active_bins: Vec::new(),
             bufs: Vec::new(),
             lit: Vec::new(),
@@ -1515,6 +1659,7 @@ fn deposit_glow_chunk(
 
     let params_storage: Vec<GlowParams> = glows.iter().map(GlowParams::new).collect();
     let params: &[GlowParams] = &params_storage;
+    let exp_t = FAST_EXP_LUT.get_or_init(build_fast_exp_lut);
     for (i, gl) in params.iter().enumerate() {
         mark_glow_bins(gl, 1u64 << i, &mut cache.bin_glows, &mut cache.active_bins);
     }
@@ -1573,7 +1718,7 @@ fn deposit_glow_chunk(
                         let dz = gl.p[2] - sample[2];
                         let dm2 = dx * dx + dy * dy + dz * dz;
                         if dm2 <= gl.reach2 {
-                            let e = fast_exp_neg(dm2 * gl.inv2h) as f32;
+                            let e = fast_exp_lut(dm2 * gl.inv2h, exp_t);
                             let k = x + FAST_SUBDIV * y + FAST_SUBDIV * FAST_SUBDIV * z;
                             field[k][0] += gl.c[0] as f32 * e;
                             field[k][1] += gl.c[1] as f32 * e;
@@ -1583,10 +1728,14 @@ fn deposit_glow_chunk(
                 }
             }
         }
-        let field_index = cache.bin_fast.len() as u32;
-        cache.bin_field[b] = field_index;
+        if field.iter().any(|value| *value != [0.0; 3]) {
+            let field_index = cache.bin_fast.len() as u32;
+            cache.bin_field[b] = field_index;
+            cache.bin_fast.push(field);
+        } else {
+            cache.bin_field[b] = u32::MAX;
+        }
         cache.bin_exact[b] = exact;
-        cache.bin_fast.push(field);
     }
 
     if cache.grid_len != grid_len {
@@ -1596,7 +1745,7 @@ fn deposit_glow_chunk(
         cache.grid_len = grid_len;
     }
     let bytes_per_buf = grid_len
-        .saturating_mul(std::mem::size_of::<[f64; 3]>())
+        .saturating_mul(std::mem::size_of::<[f64; 3]>() + std::mem::size_of::<[f32; 3]>())
         .max(1);
     let memory_workers = (GLOW_BUF_BUDGET / bytes_per_buf).max(1);
     let nt = if par {
@@ -1606,39 +1755,48 @@ fn deposit_glow_chunk(
     };
     let erf_t = ERF_LUT.get_or_init(build_erf_lut);
 
+    let workers = nt.max(1);
+    while cache.bufs.len() < workers {
+        cache.bufs.push(GlowBuf::new());
+    }
+    for buf in cache.bufs.iter_mut().take(workers) {
+        buf.resize(grid_len);
+    }
+
     if nt <= 1 {
-        let active_bins = &cache.active_bins;
-        let bin_field = &cache.bin_field;
-        let bin_fast = &cache.bin_fast;
-        let bin_exact = &cache.bin_exact;
-        let st = &mut cache.st;
-        let lit = &mut cache.lit;
-        deposit_bin_range(
-            active_bins,
-            0,
-            active_bins.len(),
-            bin_field,
-            bin_fast,
-            bin_exact,
-            segs,
-            bin_off,
-            params,
-            erf_t,
-            st,
-            lit,
-        );
+        {
+            let active_bins = &cache.active_bins;
+            let bin_field = &cache.bin_field;
+            let bin_fast = &cache.bin_fast;
+            let bin_exact = &cache.bin_exact;
+            let fast_segs = &cache.fast_segs;
+            let fast_off = &cache.fast_off;
+            let buf = &mut cache.bufs[0];
+            deposit_bin_range(
+                active_bins,
+                0,
+                active_bins.len(),
+                bin_field,
+                bin_fast,
+                bin_exact,
+                fast_segs,
+                fast_off,
+                segs,
+                bin_off,
+                params,
+                erf_t,
+                buf,
+            );
+        }
+        reduce_glow_buf(&mut cache.bufs[0], &mut cache.st, &mut cache.lit);
     } else {
-        while cache.bufs.len() < nt {
-            cache.bufs.push(GlowBuf::new());
-        }
-        for buf in cache.bufs.iter_mut().take(nt) {
-            buf.resize(grid_len);
-        }
         let ranges = split_bin_work(&cache.active_bins, bin_off, nt);
         let active_bins = &cache.active_bins;
         let bin_field = &cache.bin_field;
         let bin_fast = &cache.bin_fast;
         let bin_exact = &cache.bin_exact;
+        let fast_segs = &cache.fast_segs;
+        let fast_off = &cache.fast_off;
         let bufs = &mut cache.bufs;
         std::thread::scope(|sc| {
             for ((begin, end), buf) in ranges.iter().copied().zip(bufs.iter_mut().take(nt)) {
@@ -1650,33 +1808,21 @@ fn deposit_glow_chunk(
                         bin_field,
                         bin_fast,
                         bin_exact,
+                        fast_segs,
+                        fast_off,
                         segs,
                         bin_off,
                         params,
                         erf_t,
-                        &mut buf.px,
-                        &mut buf.touched,
+                        buf,
                     );
                 });
             }
         });
-        // Reduction remains deterministic in worker/range order. The sum is
-        // mathematically identical to the old glow-major accumulation; only
-        // floating-point association inside a pixel changes before the final
-        // display quantisation.
+        // Reduction remains deterministic in worker/range order. Fast field
+        // sums are accumulated in f32; exact stellar sums remain f64.
         for buf in cache.bufs.iter_mut().take(ranges.len()) {
-            for px in buf.touched.drain(..) {
-                let px = px as usize;
-                let add = buf.px[px];
-                buf.px[px] = [0.0; 3];
-                let dst = &mut cache.st[px];
-                if *dst == [0.0; 3] {
-                    cache.lit.push(px as u32);
-                }
-                dst[0] += add[0];
-                dst[1] += add[1];
-                dst[2] += add[2];
-            }
+            reduce_glow_buf(buf, &mut cache.st, &mut cache.lit);
         }
     }
 
@@ -1724,6 +1870,9 @@ fn deposit_glows(
     }
     if glows.is_empty() || segs.is_empty() {
         return;
+    }
+    if glows.iter().any(|glow| glow.fast) && cache.fast_off.len() != bin_off.len() {
+        build_fast_arena(segs, bin_off, &mut cache.fast_segs, &mut cache.fast_off);
     }
     if cache.grid_len != grid_len {
         cache.bufs.clear();
@@ -3405,6 +3554,8 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
         // The geometry is being replaced, so the side-buffered glow values
         // no longer belong to these pixels even when the grid size is stable.
         cache.glow.st.clear();
+        cache.glow.fast_segs.clear();
+        cache.glow.fast_off.clear();
         // same reuse story as the pixel buffer: a stable-size re-trace (zoom)
         // overwrites every entry anyway
         if cache.geo.len() != w * h {
