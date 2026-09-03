@@ -646,6 +646,12 @@ const TIDAL_SHED_W: f64 = 0.0002;
 const TIDAL_STREAM_MAX: usize = 160;
 const TIDAL_STREAM_GROUP: usize = 4;
 const TIDAL_STREAM_BRI: f64 = 260.0;
+/// A grouped tidal glow is only a good approximation while its parcels are
+/// near one another. Once they occupy separate orbital branches, gradually
+/// replace it with individual deposits so that one fading parcel cannot
+/// teleport the group's weighted centroid to another branch.
+const TIDAL_GROUP_SPLIT_START: f64 = 2.0;
+const TIDAL_GROUP_MAX_SPREAD: f64 = 3.0;
 /// Guard the approximation against widely separated/unstable parcels. A
 /// funnel glow larger than this would illuminate most of the cached ray grid
 /// and both wash out the image and destroy the frame time.
@@ -2509,11 +2515,34 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
         {
             end += 1;
         }
+        let group = &st.streams[si..end];
+        let mut spread2: f64 = 0.0;
+        for (i, a) in group.iter().enumerate() {
+            for b in &group[i + 1..] {
+                spread2 = spread2.max((a.p - b.p).len2());
+            }
+        }
+        let split_factor = if first.funnel != FunnelMode::Tidal {
+            0.0
+        } else if group.len() < first.funnel.stream_group()
+            || group
+                .iter()
+                .any(|stm| funnel_horizon_fade(stm.p.len()) < 0.5)
+        {
+            1.0
+        } else {
+            smoothstep(
+                TIDAL_GROUP_SPLIT_START,
+                TIDAL_GROUP_MAX_SPREAD,
+                spread2.sqrt(),
+            )
+        };
+
         let mut weight = 0.0;
         let mut position = V3::new(0.0, 0.0, 0.0);
         let mut sig2 = 0.0;
         let mut second_moment = 0.0;
-        for stm in &st.streams[si..end] {
+        for stm in group {
             let b = 1.0 - stm.age / stm.life;
             let horizon = funnel_horizon_fade(stm.p.len());
             let w = stm.bri * stm.w * b * stm.funnel.stream_gain(stm.p.len()) * horizon;
@@ -2523,7 +2552,10 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
             sig2 += sig * sig * w;
             second_moment += stm.p.len2() * w;
         }
-        if weight > 0.0 {
+        // Keep total brightness conserved while transitioning from the
+        // grouped approximation to individual branch glows.
+        let grouped_weight = weight * (1.0 - split_factor);
+        if grouped_weight > 0.0 {
             position = position * weight.recip();
             // The tidal profile's grouped glow also carries the positional
             // variance of its parcels. This smooths the denser simulation
@@ -2540,10 +2572,30 @@ fn glow_list(st: &Stars, orb: f64) -> Vec<Glow> {
                 .clamp(0.35, SUPER_STREAM_SIG_MAX.min(1.5));
             g.push(Glow {
                 p: rot(position),
-                c: [weight, 0.75 * weight, 0.45 * weight],
+                c: [grouped_weight, 0.75 * grouped_weight, 0.45 * grouped_weight],
                 sig,
                 fast: true,
             });
+        }
+        if split_factor > 0.0 {
+            // A sheared stream can put neighbouring launch parcels on
+            // different orbital branches. Keep each branch anchored to its
+            // own position instead of letting a horizon fade move one large
+            // weighted centroid across the frame.
+            for stm in group {
+                let b = 1.0 - stm.age / stm.life;
+                let horizon = funnel_horizon_fade(stm.p.len());
+                let w = stm.bri * stm.w * b * stm.funnel.stream_gain(stm.p.len()) * horizon;
+                let w = w * split_factor;
+                if w > 0.0 {
+                    g.push(Glow {
+                        p: rot(stm.p),
+                        c: [w, 0.75 * w, 0.45 * w],
+                        sig: stm.funnel.stream_sig(stm.p.len()),
+                        fast: true,
+                    });
+                }
+            }
         }
         si = end;
     }
@@ -4805,6 +4857,50 @@ mod tests {
                 .windows(2)
                 .any(|pair| (pair[0].v - pair[1].v).len() > 1e-6),
             "tidal parcels all follow the same ballistic path"
+        );
+    }
+
+    #[test]
+    fn tidal_glow_splits_separated_or_incomplete_groups() {
+        let parcel = |p| Stream {
+            p,
+            v: V3::new(0.0, 1.0, 0.0),
+            w: TIDAL_SHED_W,
+            group: 0,
+            age: 0.0,
+            life: SUPER_STREAM_LIFE,
+            drag: FunnelMode::Tidal.stream_drag(),
+            bri: FunnelMode::Tidal.stream_brightness(),
+            sig: STREAM_SIG,
+            fun: true,
+            funnel: FunnelMode::Tidal,
+        };
+        let mut stars = Stars::new();
+        stars.streams = vec![
+            parcel(V3::new(10.0, 0.0, 0.0)),
+            parcel(V3::new(10.5, 0.0, 0.0)),
+            parcel(V3::new(10.5, 0.5, 0.0)),
+            parcel(V3::new(11.0, 1.0, 0.0)),
+        ];
+
+        assert_eq!(
+            glow_list(&stars, 0.0).len(),
+            1,
+            "compact group should stay merged"
+        );
+
+        stars.streams[3].p = V3::new(14.0, 0.0, 0.0);
+        assert_eq!(
+            glow_list(&stars, 0.0).len(),
+            4,
+            "separated tidal branches must not share one centroid"
+        );
+
+        stars.streams.pop();
+        assert_eq!(
+            glow_list(&stars, 0.0).len(),
+            3,
+            "an incomplete group must not jump when a parcel disappears"
         );
     }
 
