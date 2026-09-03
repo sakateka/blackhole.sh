@@ -4451,10 +4451,19 @@ fn draw_braille(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
 /// has no background or inverse attribute, and uses a dim neutral grey so it
 /// does not compete with the scene. The measured frame rate leads the line
 /// in a lighter grey - the one number that changes every frame deserves the
-/// one bit of emphasis the bar has.
-fn draw_status(o: &Opt, out: &mut String, t: f64, paused: bool, fps: f64) {
-    let state = if paused { " | paused" } else { "" };
-    let head = format!(" fps:{:.1}", fps);
+/// one bit of emphasis the bar has. `render_ms` is the CPU time spent in
+/// `render_frame`, excluding frame-pacing sleep and terminal output.
+#[derive(Clone, Copy)]
+struct StatusLine {
+    t: f64,
+    paused: bool,
+    fps: f64,
+    render_ms: f64,
+}
+
+fn draw_status(o: &Opt, out: &mut String, status: StatusLine) {
+    let state = if status.paused { " | paused" } else { "" };
+    let head = format!(" fps:{:.1} render:{:.2}ms", status.fps, status.render_ms);
     let text = format!(
         " | funnel:{} | speed:{:.2}x | zoom:{:.2} | tilt:{:+.1}° | orbit:{:+.1}°/s{} | t:{:.1}",
         o.funnel.name(),
@@ -4463,7 +4472,7 @@ fn draw_status(o: &Opt, out: &mut String, t: f64, paused: bool, fps: f64) {
         o.tilt,
         o.orbit,
         state,
-        t
+        status.t
     );
     let width = o.cols.max(1);
     let head_vis: String = head.chars().take(width).collect();
@@ -4495,7 +4504,7 @@ fn draw_status(o: &Opt, out: &mut String, t: f64, paused: bool, fps: f64) {
 /// broken run-length compression in every band it touches.
 const SIXEL_SKY_CUT: f64 = 0.17;
 
-fn draw_sixel(o: &Opt, f: &Frame, out: &mut String, t: f64, paused: bool, fps: f64) {
+fn draw_sixel(o: &Opt, f: &Frame, out: &mut String, status: StatusLine) {
     // Sixel paints device pixels, so map the ray grid up to the target size
     // (nearest neighbour) instead of drawing the picture a fifth of the
     // window wide. Reserve the last terminal row for the status line.
@@ -4609,7 +4618,7 @@ fn draw_sixel(o: &Opt, f: &Frame, out: &mut String, t: f64, paused: bool, fps: f
         }
     }
     out.push_str("\x1b\\");
-    draw_status(o, out, t, paused, fps);
+    draw_status(o, out, status);
 }
 
 /// 216-cube index of a colour (0..215)
@@ -4666,9 +4675,22 @@ fn main() {
         }
         o.azi = final_azi;
         let glows = glow_list(&stars, o.azi);
+        let render_start = Instant::now();
         render_frame(&o, t, &mut f, &mut cache, &glows);
+        let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
         let mut scr = Screen::new();
-        draw_into(&o, &f, &mut out, &mut scr, t, false, o.fps);
+        draw_into(
+            &o,
+            &f,
+            &mut out,
+            &mut scr,
+            StatusLine {
+                t,
+                paused: false,
+                fps: o.fps,
+                render_ms,
+            },
+        );
         println!("{out}");
         return;
     }
@@ -4711,10 +4733,23 @@ fn main() {
         }
         if !paused || !drawn {
             let glows = glow_list(&stars, o.azi);
+            let render_start = Instant::now();
             render_frame(&o, t, &mut f, &mut cache, &glows);
+            let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
             out.clear();
             out.push_str("\x1b[H");
-            draw_into(&o, &f, &mut out, &mut scr, t, paused, fps);
+            draw_into(
+                &o,
+                &f,
+                &mut out,
+                &mut scr,
+                StatusLine {
+                    t,
+                    paused,
+                    fps,
+                    render_ms,
+                },
+            );
             let _ = so.write_all(out.as_bytes());
             let _ = so.flush();
             let now = Instant::now();
@@ -4808,25 +4843,17 @@ fn main() {
     let _ = so.flush();
 }
 
-fn draw_into(
-    o: &Opt,
-    f: &Frame,
-    out: &mut String,
-    scr: &mut Screen,
-    t: f64,
-    paused: bool,
-    fps: f64,
-) {
+fn draw_into(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen, status: StatusLine) {
     match o.mode {
         Mode::Ascii => {
             draw_ascii(o, f, out, scr);
-            draw_status(o, out, t, paused, fps);
+            draw_status(o, out, status);
         }
         Mode::Braille => {
             draw_braille(o, f, out, scr);
-            draw_status(o, out, t, paused, fps);
+            draw_status(o, out, status);
         }
-        Mode::Sixel => draw_sixel(o, f, out, t, paused, fps),
+        Mode::Sixel => draw_sixel(o, f, out, status),
     }
 }
 
