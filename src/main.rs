@@ -1126,9 +1126,7 @@ fn add_fast_pixel(buf: &mut GlowBuf, px: u32, energy: f32) {
     // Fast field values are non-negative. Do not maintain a touched list for
     // this dense path; the reduction scans the small output grid once, which
     // is cheaper than a branch and push for every path segment.
-    // SAFETY: `px` is copied from a traced segment and every segment is
-    // created for a pixel in the current ray grid.
-    let dst = unsafe { buf.fast_px.get_unchecked_mut(px as usize) };
+    let dst = &mut buf.fast_px[px as usize];
     // All fast funnel primitives share this fixed shock-heated colour ratio;
     // keep only scalar energy in both the field and the worker buffer.
     *dst += energy;
@@ -1202,26 +1200,12 @@ fn deposit_bin_range(
         let exact = bin_data.exact;
         if bin_field[b] != u32::MAX && bin_data.peak >= FAST_BIN_LOD_MIN {
             let field = &bin_data.field;
-            if fast_off.len() == bin_off.len() {
-                // The compact arena keeps the full segment records out of
-                // the hot funnel pass. Stellar bins still replay their exact
-                // source against the cold records below.
-                for fs in &fast_segs[fast_off[b] as usize..fast_off[b + 1] as usize] {
-                    // SAFETY: `sub` is assigned by `fast_subcell`, whose
-                    // range is exactly FAST_SUBCELLS.
-                    let fast = unsafe { field.get_unchecked(fs.sub as usize) };
-                    add_fast_pixel(buf, fs.px, fast * fs.weight);
-                }
-            } else {
-                // No compact arena is needed for a stellar-only scene, but
-                // retain this fallback for a fast glow on its first frame.
-                for s in &segs[bin_off[b] as usize..bin_off[b + 1] as usize] {
-                    // SAFETY: `sub` is assigned by `fast_subcell`, whose
-                    // range is exactly FAST_SUBCELLS.
-                    let fast = unsafe { field.get_unchecked(s.sub as usize) };
-                    let scale = s.dl * s.tr;
-                    add_fast_pixel(buf, s.px, fast * scale);
-                }
+            // The compact arena is built before this kernel whenever a fast
+            // glow exists. Keeping the fallback out of the hot loop makes
+            // the common sparse-matrix representation branch-free.
+            for fs in &fast_segs[fast_off[b] as usize..fast_off[b + 1] as usize] {
+                let fast = field[(fs.px_sub & FAST_SUB_MASK) as usize];
+                add_fast_pixel(buf, fs.px_sub >> FAST_SUB_BITS, fast * fs.weight);
             }
         }
         if exact != 0 {
@@ -1287,6 +1271,8 @@ const BIN_W: f64 = 1.2;
 /// one Gaussian for every traced segment.
 const FAST_SUBDIV: usize = 4;
 const FAST_SUBCELLS: usize = FAST_SUBDIV * FAST_SUBDIV * FAST_SUBDIV;
+const FAST_SUB_BITS: u32 = 6;
+const FAST_SUB_MASK: u32 = (1 << FAST_SUB_BITS) - 1;
 /// Importance threshold for the adaptive fast-field LOD experiment. Zero is
 /// the reference path; non-zero values drop whole low-energy spatial bins
 /// whose contribution cannot normally change a terminal pixel.
@@ -1360,14 +1346,34 @@ fn build_fast_arena(segs: &[Seg], bin_off: &[u32], out: &mut Vec<FastSeg>, off: 
     off.reserve(bin_off.len());
     off.push(0);
     for b in 0..bin_off.len() - 1 {
+        let start = out.len();
         for s in &segs[bin_off[b] as usize..bin_off[b + 1] as usize] {
             out.push(FastSeg {
-                px: s.px,
+                px_sub: (s.px << FAST_SUB_BITS) | s.sub as u32,
                 weight: s.dl * s.tr,
-                sub: s.sub,
             });
         }
-        off.push(out.len() as u32);
+        // Keep the field vector hot by retaining bin-major traversal, but
+        // transpose each bin's scatter list into screen order. The output
+        // writes then advance through nearby pixels instead of following the
+        // arbitrary order left by the spatial permutation.
+        out[start..].sort_unstable_by_key(|s| s.px_sub);
+        // A ray can visit the same bin/subcell more than once near the
+        // photon sphere. Fold those repeated matrix entries while the bin's
+        // cache line is already hot; this is the sparse analogue of packing
+        // a dense micro-tile before feeding it to the multiply pipeline.
+        let mut write = start;
+        for read in start..out.len() {
+            let rec = out[read];
+            if write > start && out[write - 1].px_sub == rec.px_sub {
+                out[write - 1].weight += rec.weight;
+            } else {
+                out[write] = rec;
+                write += 1;
+            }
+        }
+        out.truncate(write);
+        off.push(write as u32);
     }
 }
 
@@ -1527,9 +1533,10 @@ where
 
 #[derive(Clone, Copy)]
 struct FastSeg {
-    px: u32,
+    /// Upper bits are the output pixel, low six bits the 4x4x4 subcell.
+    /// Packing makes the hot sparse record 8 bytes instead of 12.
+    px_sub: u32,
     weight: f32,
-    sub: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -1760,8 +1767,8 @@ impl GlowCache {
 /// the machine's CPU count.
 const GLOW_BUF_BUDGET: usize = 32 * 1024 * 1024;
 /// Bound persistent fast-field slots so temporal coherence cannot turn a
-/// long-running orbit into an unbounded cache. A slot is 264 bytes at the
-/// current 4x4x4 sampling, so this is about 33 MiB plus the index table.
+/// long-running orbit into an unbounded cache. A slot is 272 bytes at the
+/// current 4x4x4 sampling, so this is about 34 MiB plus the index table.
 const FAST_FIELD_CACHE_MAX: usize = 131_072;
 
 /// Lay the frame's glows over the cached geometry. Parallel workers retain
