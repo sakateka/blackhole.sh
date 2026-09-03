@@ -3302,7 +3302,7 @@ OPTIONS
 KEYS        q/Esc quit    +/- zoom    up/down tilt    left/right orbit rate    space pause
             < / > simulation speed slower/faster (same physical keys in any
             keyboard layout)
-            s spawn star    S spawn big star    x clear stars
+            s spawn star    S spawn big star    b spawn super star    x clear stars
 ";
 
 // ---------------------------------------------------------------- terminal
@@ -4370,6 +4370,10 @@ fn main() {
                 }
                 Key::Char('S') => {
                     stars.spawn(true, &o);
+                    drawn = false;
+                }
+                Key::Char('b') => {
+                    stars.spawn_super(o.origin, o.azi, o.tilt, o.funnel);
                     drawn = false;
                 }
                 Key::Char('x') => {
