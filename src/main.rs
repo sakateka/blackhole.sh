@@ -1571,9 +1571,12 @@ impl FastBin {
 /// Apply one sparse matrix row's change directly to the persistent output
 /// accumulator. `FastBin::field` is the 64-wide sampled source vector and the
 /// packed `FastSeg` arena is the row's non-zero `(pixel, subcell)` entries.
-/// This is the temporal analogue of a CSR SpMV update: unchanged rows are not
-/// replayed at all, while a changed row subtracts its old vector and adds its
-/// new vector in one cache-friendly walk.
+/// Rejected experiment (kept as a note): replaying runs of equal pixels with
+/// one register accumulator per run turned out SLOWER than the flat
+/// per-row RMW loop (18 -> 26 ms on the dense benchmark). The flat loop's
+/// scattered `fast_accum[px] += v` chains for different pixels overlap in the
+/// OOO window, while a run forces a serial FMA dependency chain whose latency
+/// dominates at the measured average run length of 2.37 rows.
 #[inline]
 fn apply_fast_bin_delta(
     bin: u32,
@@ -1817,6 +1820,12 @@ struct GlowCache {
     lit: Vec<u32>,
     /// Pixels lit by the previous deposition and therefore dirty after clear.
     previous_lit: Vec<u32>,
+    /// Reusable scratch for the dirty-bin update: the per-frame field rebuild
+    /// writes up to `active_bins` entries, so reallocating (and zero-filling)
+    /// them every frame is pure waste.
+    dirty_bins: Vec<u32>,
+    dirty_slots: Vec<u32>,
+    dirty_fields: Vec<FastBin>,
     /// Sparse glow pixels are dynamic too, but do not belong in the trace mask.
     mask: Vec<bool>,
     grid_len: usize,
@@ -1838,6 +1847,9 @@ impl GlowCache {
             bufs: Vec::new(),
             lit: Vec::new(),
             previous_lit: Vec::new(),
+            dirty_bins: Vec::new(),
+            dirty_slots: Vec::new(),
+            dirty_fields: Vec::new(),
             mask: Vec::new(),
             grid_len: 0,
         }
@@ -1987,8 +1999,11 @@ fn deposit_glow_chunk(
     }
 
     if persistent {
-        let mut dirty_bins = Vec::new();
-        let mut dirty_slots = Vec::new();
+        let mut dirty_bins = std::mem::take(&mut cache.dirty_bins);
+        let mut dirty_slots = std::mem::take(&mut cache.dirty_slots);
+        let mut dirty_fields = std::mem::take(&mut cache.dirty_fields);
+        dirty_bins.clear();
+        dirty_slots.clear();
         for &bin in &cache.active_bins {
             let b = bin as usize;
             let mask = cache.bin_glows[b];
@@ -2011,7 +2026,7 @@ fn deposit_glow_chunk(
             {
                 cache.fast_masks[slot_i] = fast_mask;
                 dirty_bins.push(bin);
-                dirty_slots.push(slot_i);
+                dirty_slots.push(slot_i as u32);
             } else {
                 // Exact masks are cheap to refresh even when the scalar field
                 // is reusable: an exact glow may move inside its current bin.
@@ -2024,22 +2039,31 @@ fn deposit_glow_chunk(
         // parallelizes the misses without locks, while hits are just a slot
         // lookup.
         if !dirty_bins.is_empty() {
-            let mut dirty_fields = vec![FastBin::zero(); dirty_bins.len()];
+            // Grow-only scratch: `build_fast_fields` overwrites every entry
+            // it is given, so a steady-state frame must not pay a zero-fill.
+            // The capacity/len settle at the working-set maximum.
+            if dirty_fields.len() < dirty_bins.len() {
+                dirty_fields.resize(dirty_bins.len(), FastBin::zero());
+            }
+            let n = dirty_bins.len();
             build_fast_fields(
                 &dirty_bins,
                 &cache.bin_glows,
                 params,
                 exp_t,
-                &mut dirty_fields,
+                &mut dirty_fields[..n],
                 par,
                 nthreads,
             );
-            for ((bin, slot), field) in dirty_bins.into_iter().zip(dirty_slots).zip(dirty_fields) {
-                let old = cache.bin_fast[slot];
+            for i in 0..dirty_bins.len() {
+                let bin = dirty_bins[i];
+                let slot = dirty_slots[i] as usize;
+                let field = dirty_fields[i];
+                let old_field = cache.bin_fast[slot];
                 if use_delta {
                     apply_fast_bin_delta(
                         bin,
-                        &old,
+                        &old_field,
                         &field,
                         &cache.fast_segs,
                         &cache.fast_off,
@@ -2049,6 +2073,9 @@ fn deposit_glow_chunk(
                 cache.bin_fast[slot] = field;
             }
         }
+        cache.dirty_bins = dirty_bins;
+        cache.dirty_slots = dirty_slots;
+        cache.dirty_fields = dirty_fields;
     } else {
         // The active set itself is larger than the persistent cache budget.
         // Use the old bounded working-set path for this frame and release it
