@@ -1181,8 +1181,7 @@ fn deposit_bin_range(
     begin: usize,
     end: usize,
     bin_field: &[u32],
-    bin_fast: &[[[f32; 3]; FAST_SUBCELLS]],
-    bin_exact: &[u64],
+    bin_fast: &[FastBin],
     fast_segs: &[FastSeg],
     fast_off: &[u32],
     segs: &[Seg],
@@ -1193,9 +1192,10 @@ fn deposit_bin_range(
 ) {
     for &bin in &active_bins[begin..end] {
         let b = bin as usize;
-        let exact = bin_exact[b];
+        let bin_data = &bin_fast[bin_field[b] as usize];
+        let exact = bin_data.exact;
         if bin_field[b] != u32::MAX {
-            let field = &bin_fast[bin_field[b] as usize];
+            let field = &bin_data.field;
             if fast_off.len() == bin_off.len() {
                 // The compact arena keeps the full segment records out of
                 // the hot funnel pass. Stellar bins still replay their exact
@@ -1534,6 +1534,99 @@ struct FastSeg {
     sub: u8,
 }
 
+#[derive(Clone, Copy)]
+struct FastBin {
+    field: [[f32; 3]; FAST_SUBCELLS],
+    exact: u64,
+}
+
+impl FastBin {
+    fn zero() -> FastBin {
+        FastBin {
+            field: [[0.0; 3]; FAST_SUBCELLS],
+            exact: 0,
+        }
+    }
+}
+
+fn build_fast_bin(bin: u32, mask: u64, params: &[GlowParams], exp_t: &[f32]) -> FastBin {
+    let b = bin as usize;
+    let bx = b % BIN_N;
+    let by = (b / BIN_N) % BIN_N;
+    let bz = b / (BIN_N * BIN_N);
+    let lo = [
+        (bx as isize - BIN_C) as f64 * BIN_W,
+        (by as isize - BIN_C) as f64 * BIN_W,
+        (bz as isize - BIN_C) as f64 * BIN_W,
+    ];
+    let mut bits = mask;
+    let mut out = FastBin::zero();
+    while bits != 0 {
+        let i = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        let gl = &params[i];
+        if !gl.fast {
+            out.exact |= 1u64 << i;
+            continue;
+        }
+        for z in 0..FAST_SUBDIV {
+            for y in 0..FAST_SUBDIV {
+                for x in 0..FAST_SUBDIV {
+                    let sample = [
+                        lo[0] + (x as f64 + 0.5) * BIN_W / FAST_SUBDIV as f64,
+                        lo[1] + (y as f64 + 0.5) * BIN_W / FAST_SUBDIV as f64,
+                        lo[2] + (z as f64 + 0.5) * BIN_W / FAST_SUBDIV as f64,
+                    ];
+                    let dx = gl.p[0] - sample[0];
+                    let dy = gl.p[1] - sample[1];
+                    let dz = gl.p[2] - sample[2];
+                    let dm2 = dx * dx + dy * dy + dz * dz;
+                    if dm2 <= gl.reach2 {
+                        let e = fast_exp_lut(dm2 * gl.inv2h, exp_t);
+                        let k = x + FAST_SUBDIV * y + FAST_SUBDIV * FAST_SUBDIV * z;
+                        out.field[k][0] += gl.c[0] as f32 * e;
+                        out.field[k][1] += gl.c[1] as f32 * e;
+                        out.field[k][2] += gl.c[2] as f32 * e;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn build_fast_fields(
+    active_bins: &[u32],
+    bin_glows: &[u64],
+    params: &[GlowParams],
+    exp_t: &[f32],
+    fields: &mut [FastBin],
+    par: bool,
+    nthreads: usize,
+) {
+    let workers = if par {
+        nthreads.min(active_bins.len()).max(1)
+    } else {
+        1
+    };
+    let chunk = active_bins.len().div_ceil(workers).max(1);
+    if workers == 1 {
+        for (&bin, out) in active_bins.iter().zip(fields.iter_mut()) {
+            *out = build_fast_bin(bin, bin_glows[bin as usize], params, exp_t);
+        }
+    } else {
+        std::thread::scope(|scope| {
+            for (bins, out) in active_bins.chunks(chunk).zip(fields.chunks_mut(chunk)) {
+                scope.spawn(move || {
+                    for (&bin, dst) in bins.iter().zip(out.iter_mut()) {
+                        *dst = build_fast_bin(bin, bin_glows[bin as usize], params, exp_t);
+                    }
+                });
+            }
+        });
+    }
+}
+
 /// Per-worker glow accumulation. `px` is dense so updates need no hashing;
 /// `touched` makes clearing and reduction proportional to the number of lit
 /// pixels rather than the size of the entire ray grid.
@@ -1577,10 +1670,7 @@ struct GlowCache {
     /// only for active bins so the 75^3 query cube does not consume hundreds
     /// of megabytes for empty cells.
     bin_field: Vec<u32>,
-    bin_fast: Vec<[[f32; 3]; FAST_SUBCELLS]>,
-    /// Exact stellar glow mask for each bin; funnel glows are represented by
-    /// the sampled fast field above.
-    bin_exact: Vec<u64>,
+    bin_fast: Vec<FastBin>,
     /// Compact hot-path copy of the segment metadata needed by the sampled
     /// funnel field. The full `Seg` arena remains available only for exact
     /// stellar bins.
@@ -1604,7 +1694,6 @@ impl GlowCache {
             bin_glows: Vec::new(),
             bin_field: Vec::new(),
             bin_fast: Vec::new(),
-            bin_exact: Vec::new(),
             fast_segs: Vec::new(),
             fast_off: Vec::new(),
             active_bins: Vec::new(),
@@ -1651,7 +1740,6 @@ fn deposit_glow_chunk(
         cache.bin_glows[b] = 0;
         if b < cache.bin_field.len() {
             cache.bin_field[b] = u32::MAX;
-            cache.bin_exact[b] = 0;
         }
     }
     cache.active_bins.clear();
@@ -1677,66 +1765,26 @@ fn deposit_glow_chunk(
     if cache.bin_field.len() != bin_len {
         cache.bin_field.resize(bin_len, u32::MAX);
     }
-    if cache.bin_exact.len() != bin_len {
-        cache.bin_exact.resize(bin_len, 0);
+    cache.bin_fast.clear();
+    cache
+        .bin_fast
+        .resize(cache.active_bins.len(), FastBin::zero());
+    for (i, &bin) in cache.active_bins.iter().enumerate() {
+        cache.bin_field[bin as usize] = i as u32;
     }
     // Funnel groups are broad, low-contrast midpoint primitives. Accumulate
     // their Gaussian field at a 4x4x4 sub-grid for each active bin. The
-    // expensive source evaluation is consequently paid once per bin/source,
-    // not once per traced segment/source pair. Stellar glows remain exact.
-    for &bin in &cache.active_bins {
-        let b = bin as usize;
-        let mut bits = cache.bin_glows[b];
-        let bx = b % BIN_N;
-        let by = (b / BIN_N) % BIN_N;
-        let bz = b / (BIN_N * BIN_N);
-        let lo = [
-            (bx as isize - BIN_C) as f64 * BIN_W,
-            (by as isize - BIN_C) as f64 * BIN_W,
-            (bz as isize - BIN_C) as f64 * BIN_W,
-        ];
-        let mut field = [[0.0f32; 3]; FAST_SUBCELLS];
-        let mut exact = 0u64;
-        while bits != 0 {
-            let i = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let gl = &params[i];
-            if !gl.fast {
-                exact |= 1u64 << i;
-                continue;
-            }
-            for z in 0..FAST_SUBDIV {
-                for y in 0..FAST_SUBDIV {
-                    for x in 0..FAST_SUBDIV {
-                        let sample = [
-                            lo[0] + (x as f64 + 0.5) * BIN_W / FAST_SUBDIV as f64,
-                            lo[1] + (y as f64 + 0.5) * BIN_W / FAST_SUBDIV as f64,
-                            lo[2] + (z as f64 + 0.5) * BIN_W / FAST_SUBDIV as f64,
-                        ];
-                        let dx = gl.p[0] - sample[0];
-                        let dy = gl.p[1] - sample[1];
-                        let dz = gl.p[2] - sample[2];
-                        let dm2 = dx * dx + dy * dy + dz * dz;
-                        if dm2 <= gl.reach2 {
-                            let e = fast_exp_lut(dm2 * gl.inv2h, exp_t);
-                            let k = x + FAST_SUBDIV * y + FAST_SUBDIV * FAST_SUBDIV * z;
-                            field[k][0] += gl.c[0] as f32 * e;
-                            field[k][1] += gl.c[1] as f32 * e;
-                            field[k][2] += gl.c[2] as f32 * e;
-                        }
-                    }
-                }
-            }
-        }
-        if field.iter().any(|value| *value != [0.0; 3]) {
-            let field_index = cache.bin_fast.len() as u32;
-            cache.bin_field[b] = field_index;
-            cache.bin_fast.push(field);
-        } else {
-            cache.bin_field[b] = u32::MAX;
-        }
-        cache.bin_exact[b] = exact;
-    }
+    // independent bins make this setup parallel without locks; stellar glow
+    // masks travel with the same compact record and remain exact.
+    build_fast_fields(
+        &cache.active_bins,
+        &cache.bin_glows,
+        params,
+        exp_t,
+        &mut cache.bin_fast,
+        par,
+        nthreads,
+    );
 
     if cache.grid_len != grid_len {
         // A size change is an I-frame event, so release all old worker
@@ -1768,7 +1816,6 @@ fn deposit_glow_chunk(
             let active_bins = &cache.active_bins;
             let bin_field = &cache.bin_field;
             let bin_fast = &cache.bin_fast;
-            let bin_exact = &cache.bin_exact;
             let fast_segs = &cache.fast_segs;
             let fast_off = &cache.fast_off;
             let buf = &mut cache.bufs[0];
@@ -1778,7 +1825,6 @@ fn deposit_glow_chunk(
                 active_bins.len(),
                 bin_field,
                 bin_fast,
-                bin_exact,
                 fast_segs,
                 fast_off,
                 segs,
@@ -1794,7 +1840,6 @@ fn deposit_glow_chunk(
         let active_bins = &cache.active_bins;
         let bin_field = &cache.bin_field;
         let bin_fast = &cache.bin_fast;
-        let bin_exact = &cache.bin_exact;
         let fast_segs = &cache.fast_segs;
         let fast_off = &cache.fast_off;
         let bufs = &mut cache.bufs;
@@ -1807,7 +1852,6 @@ fn deposit_glow_chunk(
                         end,
                         bin_field,
                         bin_fast,
-                        bin_exact,
                         fast_segs,
                         fast_off,
                         segs,
@@ -1830,7 +1874,6 @@ fn deposit_glow_chunk(
         let b = cache.active_bins[i] as usize;
         cache.bin_glows[b] = 0;
         cache.bin_field[b] = u32::MAX;
-        cache.bin_exact[b] = 0;
     }
     cache.bin_fast.clear();
     cache.active_bins.clear();
