@@ -1278,6 +1278,11 @@ const FAST_SUBDIV: usize = 4;
 const FAST_SUBCELLS: usize = FAST_SUBDIV * FAST_SUBDIV * FAST_SUBDIV;
 const FAST_SUB_BITS: u32 = 6;
 const FAST_SUB_MASK: u32 = (1 << FAST_SUB_BITS) - 1;
+/// Midpoints of the four scalar subcells on one bin axis. Keeping these tiny
+/// offsets in read-only data removes three multiplies and the temporary
+/// sample vector from every source/subcell evaluation.
+const FAST_SUB_OFFSETS: [f64; FAST_SUBDIV] =
+    [BIN_W * 0.125, BIN_W * 0.375, BIN_W * 0.625, BIN_W * 0.875];
 /// Importance threshold for the adaptive fast-field LOD experiment. Zero is
 /// the reference path; non-zero values drop whole low-energy spatial bins
 /// whose contribution cannot normally change a terminal pixel.
@@ -1579,19 +1584,36 @@ fn apply_fast_bin_delta(
     fast_accum: &mut [f32],
 ) {
     let b = bin as usize;
-    let Some((&start, &end)) = fast_off.get(b).zip(fast_off.get(b + 1)) else {
+    let Some((&seg_start, &seg_end)) = fast_off.get(b).zip(fast_off.get(b + 1)) else {
         return;
     };
     let old_enabled = old.peak >= FAST_BIN_LOD_MIN;
     let new_enabled = new.peak >= FAST_BIN_LOD_MIN;
-    if !old_enabled && !new_enabled {
-        return;
-    }
-    for fs in &fast_segs[start as usize..end as usize] {
-        let sub = (fs.px_sub & FAST_SUB_MASK) as usize;
-        let before = if old_enabled { old.field[sub] } else { 0.0 };
-        let after = if new_enabled { new.field[sub] } else { 0.0 };
-        fast_accum[(fs.px_sub >> FAST_SUB_BITS) as usize] += (after - before) * fs.weight;
+    let rows = &fast_segs[seg_start as usize..seg_end as usize];
+    match (old_enabled, new_enabled) {
+        (false, false) => {}
+        (false, true) => {
+            for fs in rows {
+                let sub = (fs.px_sub & FAST_SUB_MASK) as usize;
+                fast_accum[(fs.px_sub >> FAST_SUB_BITS) as usize] += new.field[sub] * fs.weight;
+            }
+        }
+        (true, false) => {
+            for fs in rows {
+                let sub = (fs.px_sub & FAST_SUB_MASK) as usize;
+                fast_accum[(fs.px_sub >> FAST_SUB_BITS) as usize] -= old.field[sub] * fs.weight;
+            }
+        }
+        (true, true) => {
+            let mut delta = [0.0f32; FAST_SUBCELLS];
+            for (i, value) in delta.iter_mut().enumerate() {
+                *value = new.field[i] - old.field[i];
+            }
+            for fs in rows {
+                let sub = (fs.px_sub & FAST_SUB_MASK) as usize;
+                fast_accum[(fs.px_sub >> FAST_SUB_BITS) as usize] += delta[sub] * fs.weight;
+            }
+        }
     }
 }
 
@@ -1672,22 +1694,20 @@ fn build_fast_bin(bin: u32, mask: u64, params: &[GlowParams], exp_t: &[f32]) -> 
             out.exact |= 1u64 << i;
             continue;
         }
-        for z in 0..FAST_SUBDIV {
-            for y in 0..FAST_SUBDIV {
-                for x in 0..FAST_SUBDIV {
-                    let sample = [
-                        lo[0] + (x as f64 + 0.5) * BIN_W / FAST_SUBDIV as f64,
-                        lo[1] + (y as f64 + 0.5) * BIN_W / FAST_SUBDIV as f64,
-                        lo[2] + (z as f64 + 0.5) * BIN_W / FAST_SUBDIV as f64,
-                    ];
-                    let dx = gl.p[0] - sample[0];
-                    let dy = gl.p[1] - sample[1];
-                    let dz = gl.p[2] - sample[2];
+        let gx = gl.p[0] - lo[0];
+        let gy = gl.p[1] - lo[1];
+        let gz = gl.p[2] - lo[2];
+        for (z, &z_offset) in FAST_SUB_OFFSETS.iter().enumerate() {
+            let dz = gz - z_offset;
+            for (y, &y_offset) in FAST_SUB_OFFSETS.iter().enumerate() {
+                let dy = gy - y_offset;
+                let base = FAST_SUBDIV * y + FAST_SUBDIV * FAST_SUBDIV * z;
+                for (x, &x_offset) in FAST_SUB_OFFSETS.iter().enumerate() {
+                    let dx = gx - x_offset;
                     let dm2 = dx * dx + dy * dy + dz * dz;
                     if dm2 <= gl.reach2 {
                         let e = fast_exp_lut(dm2 * gl.inv2h, exp_t);
-                        let k = x + FAST_SUBDIV * y + FAST_SUBDIV * FAST_SUBDIV * z;
-                        out.field[k] += gl.c[0] as f32 * e;
+                        out.field[base + x] += gl.c[0] as f32 * e;
                     }
                 }
             }
@@ -3769,6 +3789,8 @@ impl Drop for RawTerm {
 /// A keypress, with arrow escape sequences told apart from a plain Esc.
 enum Key {
     Char(char),
+    /// A character prefixed by ESC, as sent by terminals for Alt+key.
+    AltChar(char),
     Esc,
     Up,
     Down,
@@ -3845,6 +3867,12 @@ fn poll_key() -> Option<Key> {
     if n >= 3 && (b[1] == b'[' || b[1] == b'O') {
         return seq(b[2]);
     }
+    // xterm-compatible terminals normally encode Alt+<key> as ESC followed
+    // by the key. Keep it distinct from a plain key so modified speed reset
+    // bindings do not accidentally affect the regular < / > controls.
+    if n >= 2 && b[1] != b'[' && b[1] != b'O' {
+        return Some(Key::AltChar(first_char(&b[1..n])));
+    }
     if n == 1 {
         let mut m = 0;
         for _ in 0..3 {
@@ -3856,6 +3884,9 @@ fn poll_key() -> Option<Key> {
         }
         if m >= 2 && (b[1] == b'[' || b[1] == b'O') {
             return seq(b[2]);
+        }
+        if m >= 1 && b[1] != b'[' && b[1] != b'O' {
+            return Some(Key::AltChar(first_char(&b[1..1 + m])));
         }
         return Some(Key::Esc);
     }
@@ -4775,6 +4806,9 @@ fn main() {
         if let Some(k) = poll_key() {
             match k {
                 Key::Esc | Key::Char('q') | Key::Char('c') => break,
+                Key::AltChar('<') | Key::AltChar('>') => {
+                    o.speed = 1.0;
+                }
                 Key::Char(' ') => {
                     paused = !paused;
                     last_draw = None;
@@ -5191,6 +5225,8 @@ mod tests {
         render_frame(&o, 123.0, &mut frame, &mut cache, &glows);
         let t0 = Instant::now();
         for _ in 0..64 {
+            stars.advance(0.03);
+            let glows = glow_list(&stars, 0.0);
             render_frame(&o, 123.0, &mut frame, &mut cache, &glows);
         }
         let dt = t0.elapsed();
