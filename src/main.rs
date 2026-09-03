@@ -1200,7 +1200,7 @@ fn deposit_bin_range(
         let b = bin as usize;
         let bin_data = &bin_fast[bin_field[b] as usize];
         let exact = bin_data.exact;
-        if bin_field[b] != u32::MAX {
+        if bin_field[b] != u32::MAX && bin_data.peak >= FAST_BIN_LOD_MIN {
             let field = &bin_data.field;
             if fast_off.len() == bin_off.len() {
                 // The compact arena keeps the full segment records out of
@@ -1287,6 +1287,10 @@ const BIN_W: f64 = 1.2;
 /// one Gaussian for every traced segment.
 const FAST_SUBDIV: usize = 4;
 const FAST_SUBCELLS: usize = FAST_SUBDIV * FAST_SUBDIV * FAST_SUBDIV;
+/// Importance threshold for the adaptive fast-field LOD experiment. Zero is
+/// the reference path; non-zero values drop whole low-energy spatial bins
+/// whose contribution cannot normally change a terminal pixel.
+const FAST_BIN_LOD_MIN: f32 = 1.0e-8;
 /// the cube's centre: the bin index of the coordinate origin
 const BIN_C: isize = (BIN_N as isize) / 2;
 
@@ -1533,6 +1537,7 @@ struct FastBin {
     /// All fast funnel sources share one colour ratio, so the replay only
     /// needs their scalar energy field.
     field: [f32; FAST_SUBCELLS],
+    peak: f32,
     exact: u64,
 }
 
@@ -1540,6 +1545,7 @@ impl FastBin {
     fn zero() -> FastBin {
         FastBin {
             field: [0.0; FAST_SUBCELLS],
+            peak: 0.0,
             exact: 0,
         }
     }
@@ -1623,6 +1629,7 @@ fn build_fast_bin(bin: u32, mask: u64, params: &[GlowParams], exp_t: &[f32]) -> 
             }
         }
     }
+    out.peak = out.field.iter().copied().fold(0.0, f32::max);
     out
 }
 
