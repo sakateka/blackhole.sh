@@ -4208,6 +4208,13 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
         }
     }
 
+    // The shading pass always walks a dense glow buffer alongside the cached
+    // geometry. With no stars there is no glow deposition to size that
+    // buffer, but the black hole and the sky still need to be shaded.
+    if cache.glow.st.len() != cache.geo.len() {
+        cache.glow.st.resize(cache.geo.len(), [0.0; 3]);
+    }
+
     // P-frame: re-shade the cached geometry for the current time and azimuth.
     // The one-off sample tables are wanted by the shading (and by nothing
     // else), so they are built here, once.
@@ -5025,6 +5032,62 @@ mod tests {
 
         assert_eq!(cache.st[0], [0.0; 3]);
         assert!(cache.lit.is_empty());
+    }
+
+    #[test]
+    fn empty_scene_is_shaded_and_responds_to_tilt() {
+        let mut o = Opt {
+            mode: Mode::Ascii,
+            funnel: FunnelMode::Current,
+            fps: 30.0,
+            zoom: 1.0,
+            speed: 1.0,
+            orbit: 0.0,
+            azi: 0.0,
+            tilt: CAM_TILT,
+            shift: 0.0,
+            color: false,
+            cols: 40,
+            rows: 20,
+            tpw: 80,
+            tph: 80,
+            rays: 40_000,
+            threads: 1,
+            one_shot: None,
+            star: false,
+            big_star: false,
+            super_star: false,
+            origin: None,
+            star_speed: None,
+            ramp: " .·:;+=*xX#%@█".chars().collect(),
+        };
+        let mut frame = Frame {
+            w: 0,
+            h: 0,
+            px: Vec::new(),
+        };
+        let mut cache = GeoCache::new();
+
+        render_frame(&o, 0.0, &mut frame, &mut cache, &[]);
+        assert!(
+            frame.px.iter().any(|p| *p != [0.0; 3]),
+            "an empty scene must still shade the disk and sky"
+        );
+        let first = frame.px.clone();
+
+        o.tilt = 30.0;
+        render_frame(&o, 0.0, &mut frame, &mut cache, &[]);
+        let max_error = first
+            .iter()
+            .zip(&frame.px)
+            .map(|(a, b)| {
+                (a[0] - b[0])
+                    .abs()
+                    .max((a[1] - b[1]).abs())
+                    .max((a[2] - b[2]).abs())
+            })
+            .fold(0.0, f64::max);
+        assert!(max_error > 1e-6, "tilt did not change the empty scene");
     }
 
     #[test]
