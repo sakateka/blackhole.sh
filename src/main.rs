@@ -3844,6 +3844,11 @@ fn first_char(b: &[u8]) -> char {
         .unwrap_or_else(|| b[0] as char)
 }
 
+#[inline]
+fn is_alt_speed_reset(ch: char) -> bool {
+    matches!(ch, '<' | '>' | ',' | '.' | 'б' | 'Б' | 'ю' | 'Ю')
+}
+
 /// Poll stdin for one key. Arrow keys arrive as 3-byte bursts (`ESC [ A`, or
 /// `ESC O A` in application cursor mode); a lone ESC is either the Esc key
 /// or a burst that came in fragmented, so give the terminal a few
@@ -4806,7 +4811,10 @@ fn main() {
         if let Some(k) = poll_key() {
             match k {
                 Key::Esc | Key::Char('q') | Key::Char('c') => break,
-                Key::AltChar('<') | Key::AltChar('>') => {
+                // Bind the physical comma/period keys too: shifted `<`/`>`
+                // arrive as `,`/`.` when Alt is pressed without Shift. The
+                // Cyrillic aliases cover the same physical keys on RU layout.
+                Key::AltChar(ch) if is_alt_speed_reset(ch) => {
                     o.speed = 1.0;
                 }
                 Key::Char(' ') => {
@@ -5642,5 +5650,13 @@ mod tests {
         assert_eq!(first_char("\u{044e}".as_bytes()), '\u{044e}'); // ю
         assert_eq!(first_char("\u{042e}".as_bytes()), '\u{042e}'); // Ю
         assert_eq!(first_char(&[0xff]), char::from(0xff_u8));
+    }
+
+    #[test]
+    fn alt_speed_reset_works_without_shift_on_both_layouts() {
+        for ch in ['<', '>', ',', '.', 'б', 'Б', 'ю', 'Ю'] {
+            assert!(is_alt_speed_reset(ch), "Alt+{ch} should reset speed");
+        }
+        assert!(!is_alt_speed_reset('x'));
     }
 }
