@@ -11,17 +11,20 @@ COLS=${BENCH_COLS:-80}
 ROWS=${BENCH_ROWS:-24}
 RAYS=${BENCH_RAYS:-200000}
 MODE=${BENCH_MODE:-ascii}
+THREADS=${BENCH_THREADS:-0}
+SPEED=${BENCH_SPEED:-1}
 
 cargo build --release >/dev/null || exit 1
 
-common=(--mode "$MODE" --cols "$COLS" --rows "$ROWS" --rays "$RAYS" --fps 30)
+common=(--mode "$MODE" --cols "$COLS" --rows "$ROWS" --rays "$RAYS" --fps 30
+        --speed "$SPEED" --threads "$THREADS")
 
 run_case() {
     local name=$1
     shift
     printf '\n== %s ==\n' "$name"
-    printf 'mode=%s cols=%s rows=%s rays=%s duration=%ss\n' \
-        "$MODE" "$COLS" "$ROWS" "$RAYS" "$SECONDS_TO_RUN"
+    printf 'mode=%s cols=%s rows=%s rays=%s speed=%s threads=%s duration=%ss\n' \
+        "$MODE" "$COLS" "$ROWS" "$RAYS" "$SPEED" "$THREADS" "$SECONDS_TO_RUN"
     if command -v perf >/dev/null 2>&1; then
         # timeout returns 124 when the requested measurement interval ends.
         perf stat -e task-clock,cycles,instructions,branches,branch-misses -- \
@@ -55,7 +58,8 @@ for name_f in 'super-current|--super-star --funnel current' \
     flags=${name_f#*|}
     # shellcheck disable=SC2086
     frames=$(timeout "$SECONDS_TO_RUN" "$BIN" --mode "$MODE" --cols "$COLS" \
-        --rows "$ROWS" --rays "$RAYS" --fps 240 $flags 2>/dev/null | \
+        --rows "$ROWS" --rays "$RAYS" --fps 240 --speed "$SPEED" \
+        --threads "$THREADS" $flags 2>/dev/null | \
         grep -a -o ' fps:' | wc -l)
     awk -v n="$frames" -v t="$SECONDS_TO_RUN" \
         'BEGIN { printf "%s: %d frames in %ss = %.1f fps (%.2f ms/frame)\n", \

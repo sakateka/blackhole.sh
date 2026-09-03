@@ -233,8 +233,9 @@ impl V3 {
 // are smooth enough to pre-sample:
 //  - the disk turbulence is fbm3 over (cos(phi), sin(phi), nz(rr)) - a 2D
 //    field in (phi, radius), rasterised once into a texture;
-//  - the tone curve (1 - e^-x)^(1/1.85) has infinite slope at 0, so it is
-//    sampled on a sqrt-spaced grid;
+//  - the tone curve (1 - e^-x)^(1/1.85) has infinite slope at 0; a larger
+//    uniform table keeps the interpolation error below terminal resolution
+//    while removing the per-channel sqrt;
 //  - the star twinkle needs one sin per sky pixel - a 7th-order polynomial
 //    is indistinguishable at the 0.18 amplitude it modulates.
 
@@ -246,13 +247,10 @@ static TURB_TEX: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
 
 /// Fill the turbulence texture once. About half a million noise lookups -
 /// a tenth of a second single-threaded, a few milliseconds across cores,
-/// and afterwards every frame samples it instead of recomputing fbm3.
-fn build_turb_tex() {
+/// and afterwards every frame samples it instead of recomputing fbm3. The
+/// caller supplies the worker limit so `--threads 1` stays serial end-to-end.
+fn build_turb_tex(nthreads: usize) {
     let mut tex = vec![0.0f64; TURB_RR * TURB_PHI];
-    let nthreads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(1, 32);
     let rows_per = TURB_RR.div_ceil(nthreads);
     thread::scope(|sc| {
         for (n, band) in tex.chunks_mut(rows_per * TURB_PHI).enumerate() {
@@ -293,15 +291,16 @@ fn turb(phi: f64, rr: f64) -> f64 {
     a + (b - a) * av
 }
 
-/// tone curve, sampled sqrt-spaced in x (dense where the slope blows up)
-const TONE_N: usize = 4096;
+/// tone curve, sampled on a uniform x grid. The larger table removes a sqrt
+/// from every shaded disk channel while retaining terminal-level precision.
+const TONE_N: usize = 16_384;
 const TONE_MAX: f64 = 16.0;
 static TONE: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
 
 fn build_tone() {
     let t: Vec<f64> = (0..=TONE_N)
         .map(|i| {
-            let x = TONE_MAX * (i as f64 / TONE_N as f64) * (i as f64 / TONE_N as f64);
+            let x = TONE_MAX * i as f64 / TONE_N as f64;
             (1.0 - (-x).exp()).powf(1.0 / 1.85)
         })
         .collect();
@@ -311,7 +310,7 @@ fn build_tone() {
 #[inline]
 fn tone(x: f64) -> f64 {
     let t = TONE.get().expect("tone table");
-    let s = (x.max(0.0) / TONE_MAX).sqrt() * TONE_N as f64;
+    let s = (x.max(0.0) / TONE_MAX) * TONE_N as f64;
     let i = (s as usize).min(TONE_N - 1);
     let a = s - i as f64;
     t[i] + (t[i + 1] - t[i]) * a
@@ -1123,16 +1122,16 @@ fn segment_glow_add(s: &Seg, mask: u64, glows: &[GlowParams], erf_t: &[f32]) -> 
 /// Process a range of active spatial bins. Each segment belongs to exactly
 /// one bin, so partitioning bins gives workers disjoint input without locks.
 #[inline(always)]
-fn add_fast_pixel(buf: &mut GlowBuf, px: u32, add: [f32; 3]) {
+fn add_fast_pixel(buf: &mut GlowBuf, px: u32, energy: f32) {
     // Fast field values are non-negative. Do not maintain a touched list for
     // this dense path; the reduction scans the small output grid once, which
     // is cheaper than a branch and push for every path segment.
     // SAFETY: `px` is copied from a traced segment and every segment is
     // created for a pixel in the current ray grid.
     let dst = unsafe { buf.fast_px.get_unchecked_mut(px as usize) };
-    dst[0] += add[0];
-    dst[1] += add[1];
-    dst[2] += add[2];
+    // All fast funnel primitives share this fixed shock-heated colour ratio;
+    // keep only scalar energy in both the field and the worker buffer.
+    *dst += energy;
 }
 
 #[inline(always)]
@@ -1149,23 +1148,24 @@ fn add_exact_pixel(buf: &mut GlowBuf, px: u32, add: [f64; 3]) {
     dst[2] += add[2];
 }
 
-/// Merge one worker's fast f32 field and exact f64 stellar field into the
-/// frame buffer. Keeping the two formats separate makes the hot funnel loop
-/// cheap without weakening the exact source kernel's accumulation.
+/// Merge one worker's scalar f32 funnel field and exact f64 stellar field into
+/// the frame buffer. Keeping the two formats separate makes the hot funnel
+/// loop cheap without weakening the exact source kernel's accumulation.
 fn reduce_glow_buf(buf: &mut GlowBuf, st: &mut [[f64; 3]], lit: &mut Vec<u32>) {
     for (i, slot) in buf.fast_px.iter_mut().enumerate() {
-        let add = *slot;
-        *slot = [0.0; 3];
-        if add == [0.0; 3] {
+        let energy = *slot;
+        *slot = 0.0;
+        if energy == 0.0 {
             continue;
         }
         let dst = &mut st[i];
         if *dst == [0.0; 3] {
             lit.push(i as u32);
         }
-        dst[0] += add[0] as f64;
-        dst[1] += add[1] as f64;
-        dst[2] += add[2] as f64;
+        let add = energy as f64;
+        dst[0] += add;
+        dst[1] += add * 0.75;
+        dst[2] += add * 0.45;
     }
     for px in buf.touched.drain(..) {
         let i = px as usize;
@@ -1210,15 +1210,7 @@ fn deposit_bin_range(
                     // SAFETY: `sub` is assigned by `fast_subcell`, whose
                     // range is exactly FAST_SUBCELLS.
                     let fast = unsafe { field.get_unchecked(fs.sub as usize) };
-                    add_fast_pixel(
-                        buf,
-                        fs.px,
-                        [
-                            fast[0] * fs.weight,
-                            fast[1] * fs.weight,
-                            fast[2] * fs.weight,
-                        ],
-                    );
+                    add_fast_pixel(buf, fs.px, fast * fs.weight);
                 }
             } else {
                 // No compact arena is needed for a stellar-only scene, but
@@ -1228,11 +1220,7 @@ fn deposit_bin_range(
                     // range is exactly FAST_SUBCELLS.
                     let fast = unsafe { field.get_unchecked(s.sub as usize) };
                     let scale = s.dl * s.tr;
-                    add_fast_pixel(
-                        buf,
-                        s.px,
-                        [fast[0] * scale, fast[1] * scale, fast[2] * scale],
-                    );
+                    add_fast_pixel(buf, s.px, fast * scale);
                 }
             }
         }
@@ -1542,14 +1530,16 @@ struct FastSeg {
 
 #[derive(Clone, Copy)]
 struct FastBin {
-    field: [[f32; 3]; FAST_SUBCELLS],
+    /// All fast funnel sources share one colour ratio, so the replay only
+    /// needs their scalar energy field.
+    field: [f32; FAST_SUBCELLS],
     exact: u64,
 }
 
 impl FastBin {
     fn zero() -> FastBin {
         FastBin {
-            field: [[0.0; 3]; FAST_SUBCELLS],
+            field: [0.0; FAST_SUBCELLS],
             exact: 0,
         }
     }
@@ -1590,9 +1580,7 @@ fn build_fast_bin(bin: u32, mask: u64, params: &[GlowParams], exp_t: &[f32]) -> 
                     if dm2 <= gl.reach2 {
                         let e = fast_exp_lut(dm2 * gl.inv2h, exp_t);
                         let k = x + FAST_SUBDIV * y + FAST_SUBDIV * FAST_SUBDIV * z;
-                        out.field[k][0] += gl.c[0] as f32 * e;
-                        out.field[k][1] += gl.c[1] as f32 * e;
-                        out.field[k][2] += gl.c[2] as f32 * e;
+                        out.field[k] += gl.c[0] as f32 * e;
                     }
                 }
             }
@@ -1640,9 +1628,9 @@ struct GlowBuf {
     /// Exact stellar contributions retain f64 accumulation.
     px: Vec<[f64; 3]>,
     touched: Vec<u32>,
-    /// The sampled funnel field is already f32; keeping its worker buffer in
-    /// the same format avoids widening every segment's three multiplies.
-    fast_px: Vec<[f32; 3]>,
+    /// The sampled funnel field is already scalar f32; RGB is restored only
+    /// during reduction, avoiding three channel updates per segment.
+    fast_px: Vec<f32>,
 }
 
 impl GlowBuf {
@@ -1657,8 +1645,10 @@ impl GlowBuf {
     fn resize(&mut self, len: usize) {
         if self.px.len() != len {
             self.px = vec![[0.0; 3]; len];
-            self.fast_px = vec![[0.0; 3]; len];
             self.touched.clear();
+        }
+        if self.fast_px.len() != len {
+            self.fast_px = vec![0.0; len];
         }
     }
 }
@@ -1799,7 +1789,8 @@ fn deposit_glow_chunk(
         cache.grid_len = grid_len;
     }
     let bytes_per_buf = grid_len
-        .saturating_mul(std::mem::size_of::<[f64; 3]>() + std::mem::size_of::<[f32; 3]>())
+        .saturating_mul(std::mem::size_of::<[f64; 3]>())
+        .saturating_add(grid_len.saturating_mul(std::mem::size_of::<f32>()))
         .max(1);
     let memory_workers = (GLOW_BUF_BUDGET / bytes_per_buf).max(1);
     let nt = if par {
@@ -3150,6 +3141,8 @@ struct Opt {
     tph: usize,
     /// upper bound on rays cast per frame
     rays: usize,
+    /// worker limit; zero means automatic, one is a fully serial render path
+    threads: usize,
     one_shot: Option<f64>,
     /// start with a star spiralling into the hole
     star: bool,
@@ -3191,6 +3184,7 @@ fn parse_opt() -> Opt {
         tpw: 0,
         tph: 0,
         rays: RAY_BUDGET,
+        threads: 0,
         one_shot: None,
         star: false,
         big_star: false,
@@ -3265,6 +3259,7 @@ fn parse_opt() -> Opt {
             "--cols" => o.cols = num(&args, &mut i) as usize,
             "--rows" => o.rows = num(&args, &mut i) as usize,
             "--rays" => o.rays = num(&args, &mut i).clamp(40_000.0, 4_000_000.0) as usize,
+            "--threads" => o.threads = num(&args, &mut i).clamp(0.0, 32.0) as usize,
             "--frame" => o.one_shot = Some(num(&args, &mut i)),
             "--no-color" | "--ascii-only" => o.color = false,
             _ => {
@@ -3335,6 +3330,7 @@ OPTIONS
       --rows <n>        override terminal height
       --rays <n>        ray budget per frame (default 200000); lower = faster
                         and coarser, higher = sharper and slower
+      --threads <n>     worker limit; 0 = automatic, 1 = fully single-threaded
       --frame <n>       render a single frame at time n/fps and exit
       --no-color        no ANSI colours (pure ASCII output, good for pipes)
       --star            add a star that gets swallowed by the hole
@@ -3565,6 +3561,10 @@ fn poll_key() -> Option<Key> {
 
 const SUB_X: usize = 2;
 const SUB_Y: usize = 4;
+/// Text cells are independent while they are being reduced from the ray
+/// grid. Keep small terminal windows single-threaded: the scoped-thread setup
+/// costs more than the handful of cells in those frames.
+const TEXT_PAR_MIN_CELLS: usize = 8_192;
 
 struct Frame {
     w: usize,
@@ -3593,6 +3593,47 @@ fn grid_size(o: &Opt) -> (usize, usize) {
     (w, h)
 }
 
+fn worker_count(requested: usize) -> usize {
+    if requested > 0 {
+        requested.clamp(1, 32)
+    } else {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 32)
+    }
+}
+
+/// Fill a text-cell buffer in row-aligned disjoint slices. The callback only
+/// reads the frame/options and writes its own slice, so the result remains in
+/// row-major order without locks or a second frame-sized buffer. Keeping the
+/// terminal diff/output stage outside this helper preserves the existing
+/// single-owner `Screen` architecture.
+fn fill_text_cells<F>(cells: &mut [Cell], cw: usize, ch: usize, nthreads: usize, fill: F)
+where
+    F: Fn(usize, &mut [Cell]) + Sync,
+{
+    if cells.is_empty() || cw == 0 || ch == 0 {
+        return;
+    }
+    debug_assert_eq!(cells.len(), cw * ch);
+
+    let nthreads = nthreads.min(ch);
+    if nthreads < 2 || cells.len() < TEXT_PAR_MIN_CELLS {
+        fill(0, cells);
+        return;
+    }
+
+    let rows_per = ch.div_ceil(nthreads);
+    thread::scope(|scope| {
+        for (band_no, band) in cells.chunks_mut(rows_per * cw).enumerate() {
+            let fill = &fill;
+            let y0 = band_no * rows_per;
+            scope.spawn(move || fill(y0, band));
+        }
+    });
+}
+
 fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[Glow]) {
     let (w, h) = grid_size(o);
     f.w = w;
@@ -3614,10 +3655,7 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
     let zoom = o.zoom;
     let shift = o.shift;
 
-    let nthreads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(1, 32);
+    let nthreads = worker_count(o.threads);
     // Small frames run faster on a single thread: spawning a worker costs
     // more than the shading it would do.
     let par = nthreads > 1 && w * h >= 96_000;
@@ -3764,7 +3802,7 @@ fn render_frame(o: &Opt, t: f64, f: &mut Frame, cache: &mut GeoCache, glows: &[G
     // The one-off sample tables are wanted by the shading (and by nothing
     // else), so they are built here, once.
     if TURB_TEX.get().is_none() {
-        build_turb_tex();
+        build_turb_tex(nthreads);
     }
     if TONE.get().is_none() {
         build_tone();
@@ -3993,28 +4031,37 @@ fn draw_ascii(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
     let cw = f.w / SUB_X;
     // Keep the terminal's last row for the unobtrusive status line.
     let ch = (f.h / SUB_Y).min(o.rows.saturating_sub(1));
-    let mut cells = Vec::with_capacity(cw * ch);
-    for cy in 0..ch {
-        for cx in 0..cw {
-            let mut acc = [0.0; 3];
-            for sy in 0..SUB_Y {
-                for sx in 0..SUB_X {
-                    let p = f.px[(cy * SUB_Y + sy) * f.w + cx * SUB_X + sx];
-                    acc[0] += p[0];
-                    acc[1] += p[1];
-                    acc[2] += p[2];
+    let mut cells = vec![
+        Cell {
+            ch: ' ',
+            rgb: [0; 3],
+        };
+        cw * ch
+    ];
+    fill_text_cells(&mut cells, cw, ch, worker_count(o.threads), |y0, band| {
+        for (row_no, row) in band.chunks_mut(cw).enumerate() {
+            let cy = y0 + row_no;
+            for (cx, cell) in row.iter_mut().enumerate() {
+                let mut acc = [0.0; 3];
+                for sy in 0..SUB_Y {
+                    for sx in 0..SUB_X {
+                        let p = f.px[(cy * SUB_Y + sy) * f.w + cx * SUB_X + sx];
+                        acc[0] += p[0];
+                        acc[1] += p[1];
+                        acc[2] += p[2];
+                    }
                 }
+                let n = (SUB_X * SUB_Y) as f64;
+                let c = [acc[0] / n, acc[1] / n, acc[2] / n];
+                let l = lum(&c);
+                let idx = ((ramp.len() - 1) as f64 * l).round() as usize;
+                *cell = Cell {
+                    ch: ramp[idx],
+                    rgb: cell_rgb(o, &c),
+                };
             }
-            let n = (SUB_X * SUB_Y) as f64;
-            let c = [acc[0] / n, acc[1] / n, acc[2] / n];
-            let l = lum(&c);
-            let idx = ((ramp.len() - 1) as f64 * l).round() as usize;
-            cells.push(Cell {
-                ch: ramp[idx],
-                rgb: cell_rgb(o, &c),
-            });
         }
-    }
+    });
     scr.emit(o, &cells, cw, ch, out);
 }
 
@@ -4035,47 +4082,56 @@ fn draw_braille(o: &Opt, f: &Frame, out: &mut String, scr: &mut Screen) {
     let cw = f.w / SUB_X;
     // Keep the terminal's last row for the unobtrusive status line.
     let ch = (f.h / SUB_Y).min(o.rows.saturating_sub(1));
-    let mut cells = Vec::with_capacity(cw * ch);
-    for cy in 0..ch {
-        for cx in 0..cw {
-            let mut acc = [0.0; 3];
-            let mut lums = [0.0f64; 8];
-            for sy in 0..SUB_Y {
-                for sx in 0..SUB_X {
-                    let p = f.px[(cy * SUB_Y + sy) * f.w + cx * SUB_X + sx];
-                    acc[0] += p[0];
-                    acc[1] += p[1];
-                    acc[2] += p[2];
-                    lums[sy * SUB_X + sx] = lum(&p);
-                }
-            }
-            let n = (SUB_X * SUB_Y) as f64;
-            let c = [acc[0] / n, acc[1] / n, acc[2] / n];
-            let l = lum(&c);
-            // punch the brightest sub-cells first: grey level -> number of dots
-            let dots = (l * 8.0).round() as usize;
-            let mut bits = 0u8;
-            for _ in 0..dots.min(8) {
-                let mut best = 0usize;
-                for k in 0..8 {
-                    if lums[k] > lums[best] {
-                        best = k;
+    let mut cells = vec![
+        Cell {
+            ch: ' ',
+            rgb: [0; 3],
+        };
+        cw * ch
+    ];
+    fill_text_cells(&mut cells, cw, ch, worker_count(o.threads), |y0, band| {
+        for (row_no, row) in band.chunks_mut(cw).enumerate() {
+            let cy = y0 + row_no;
+            for (cx, cell) in row.iter_mut().enumerate() {
+                let mut acc = [0.0; 3];
+                let mut lums = [0.0f64; 8];
+                for sy in 0..SUB_Y {
+                    for sx in 0..SUB_X {
+                        let p = f.px[(cy * SUB_Y + sy) * f.w + cx * SUB_X + sx];
+                        acc[0] += p[0];
+                        acc[1] += p[1];
+                        acc[2] += p[2];
+                        lums[sy * SUB_X + sx] = lum(&p);
                     }
                 }
-                lums[best] = -1.0;
-                bits |= dot_bit(best % SUB_X, best / SUB_X);
+                let n = (SUB_X * SUB_Y) as f64;
+                let c = [acc[0] / n, acc[1] / n, acc[2] / n];
+                let l = lum(&c);
+                // punch the brightest sub-cells first: grey level -> number of dots
+                let dots = (l * 8.0).round() as usize;
+                let mut bits = 0u8;
+                for _ in 0..dots.min(8) {
+                    let mut best = 0usize;
+                    for k in 0..8 {
+                        if lums[k] > lums[best] {
+                            best = k;
+                        }
+                    }
+                    lums[best] = -1.0;
+                    bits |= dot_bit(best % SUB_X, best / SUB_X);
+                }
+                // faint stars still get a single dot
+                if bits == 0 && l > 0.03 {
+                    bits = dot_bit(0, 0);
+                }
+                let ch4 = char::from_u32(0x2800 + bits as u32).unwrap_or(' ');
+                *cell = Cell {
+                    ch: ch4,
+                    rgb: cell_rgb(o, &c),
+                };
             }
-            // faint stars still get a single dot
-            if bits == 0 && l > 0.03 {
-                bits = dot_bit(0, 0);
-            }
-            let ch4 = char::from_u32(0x2800 + bits as u32).unwrap_or(' ');
-            cells.push(Cell {
-                ch: ch4,
-                rgb: cell_rgb(o, &c),
-            });
         }
-    }
+    });
     scr.emit(o, &cells, cw, ch, out);
 }
 
@@ -4525,6 +4581,19 @@ mod tests {
     }
 
     #[test]
+    fn tone_table_stays_close_to_the_curve() {
+        build_tone();
+        let mut max_error = 0.0f64;
+        for i in 0..100_001 {
+            let x = TONE_MAX * i as f64 / 100_000.0;
+            let exact = (1.0 - (-x).exp()).powf(1.0 / 1.85);
+            max_error = max_error.max((tone(x) - exact).abs());
+        }
+        println!("tone LUT max error: {max_error:.6}");
+        assert!(max_error < 0.01, "tone LUT max error: {max_error}");
+    }
+
+    #[test]
     fn gaussian_segment_integral_matches_numerical_quadrature() {
         // covers: glow mid-segment, glow near an end of a segment much
         // longer than sig (the old table clamped its length axis at 6 sig
@@ -4658,6 +4727,65 @@ mod tests {
             "deposit 40 glows x 120k segs: {dt:?} ({:.0} us/glow), sum={total:.3}",
             dt.as_micros() / 40
         );
+    }
+
+    #[test]
+    #[ignore = "perf smoke: cargo test --release render_frame_throughput -- --ignored --nocapture"]
+    fn render_frame_throughput() {
+        let o = Opt {
+            mode: Mode::Sixel,
+            funnel: FunnelMode::Spiral,
+            fps: 240.0,
+            zoom: 1.0,
+            speed: 1.0,
+            orbit: 0.0,
+            azi: 0.0,
+            tilt: CAM_TILT,
+            shift: 0.0,
+            color: true,
+            cols: 80,
+            rows: 24,
+            tpw: 800,
+            tph: 480,
+            rays: 200_000,
+            threads: 1,
+            one_shot: None,
+            star: false,
+            big_star: false,
+            super_star: true,
+            origin: None,
+            star_speed: None,
+            ramp: " .·:;+=*xX#%@█".chars().collect(),
+        };
+        let mut stars = Stars::new();
+        stars.spawn_super(None, 0.0, o.tilt, FunnelMode::Spiral);
+        // Advance to a deliberately dense, steady superstar funnel before
+        // tracing. The measured loop below replays the same cached geometry
+        // and source list, so variants are compared at identical state.
+        stars.advance(256.0);
+        let glows = glow_list(&stars, 0.0);
+        let mut frame = Frame {
+            w: 0,
+            h: 0,
+            px: Vec::new(),
+        };
+        let mut cache = GeoCache::new();
+        cache.prime(&o);
+        render_frame(&o, 123.0, &mut frame, &mut cache, &glows);
+        let t0 = Instant::now();
+        for _ in 0..64 {
+            render_frame(&o, 123.0, &mut frame, &mut cache, &glows);
+        }
+        let dt = t0.elapsed();
+        println!(
+            "render 64 dense frames: {dt:?} ({:.0} us/frame), streams={}, glows={}, segs={}, fast_segs={}",
+            dt.as_micros() as f64 / 64.0,
+            stars.streams.len(),
+            glows.len(),
+            cache.segs.len(),
+            cache.glow.fast_segs.len(),
+        );
+        std::hint::black_box(frame.px[0]);
     }
 
     #[test]
